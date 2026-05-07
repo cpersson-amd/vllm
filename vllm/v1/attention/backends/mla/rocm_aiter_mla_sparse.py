@@ -332,6 +332,13 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
+
 
 @dataclass
 class ROCMAiterMLASparseMetadataBuilder(
@@ -388,6 +395,52 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+        
+        from aiter import dtypes, get_mla_metadata_info_v1
+        self._num_attention_heads = max(16, self.num_heads)
+        q_dtype = vllm_config.model_config.dtype
+        kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+            kv_cache_dtype_str = "fp8"
+        else:
+            kv_cache_dtype_str = "bf16"
+        kv_dtype = dtypes.d_dtypes.get(kv_cache_dtype_str, dtypes.bf16)
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_batched_tokens,
+            1,
+            self._num_attention_heads,
+            q_dtype,
+            kv_dtype,
+            is_sparse=False,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
+        )
 
     def build(
         self,
@@ -431,6 +484,28 @@ class ROCMAiterMLASparseMetadataBuilder(
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
 
+        from aiter import get_mla_metadata_v1
+
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self._num_attention_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+        )
+
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -447,6 +522,12 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
         )
         return metadata
 
@@ -525,6 +606,20 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             device=q.device,
         )
 
+        mla_kwargs = dict(
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
+        )
+        if attn_metadata.work_meta_data is not None:
+            mla_kwargs.update(
+                work_meta_data=attn_metadata.work_meta_data,
+                work_indptr=attn_metadata.work_indptr,
+                work_info_set=attn_metadata.work_info_set,
+                reduce_indptr=attn_metadata.reduce_indptr,
+                reduce_final_map=attn_metadata.reduce_final_map,
+                reduce_partial_map=attn_metadata.reduce_partial_map,
+            )
+
         rocm_aiter_ops.mla_decode_fwd(
             q,
             kv_c_and_k_pe_cache,
@@ -535,8 +630,7 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             attn_metadata.paged_kv_indptr,
             attn_metadata.paged_kv_indices,
             attn_metadata.paged_kv_last_page_len,
-            q_scale=layer._q_scale,
-            kv_scale=layer._k_scale,
+            **mla_kwargs,
         )
 
         return AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
