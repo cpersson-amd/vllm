@@ -674,7 +674,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Sparse MLA impls only support forward_mqa (decode-style attention)
         is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
 
-        if is_sparse_impl:
+        if is_sparse_impl and not self.impl._fp8_prefill_enabled:
             num_mqa_tokens = q.size(0)
             num_mha_tokens = 0
         else:
