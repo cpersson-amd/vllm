@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import os
 import numpy as np
 import torch
 
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FP8_PREFILL_TILE_Q = 256
+MLA_FP8_PREFILL = os.getenv("VLLM_ROCM_FP8_MLA", "0") == "1"
 
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
@@ -404,7 +406,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
         # Pre-allocate FP8 MLA prefill PS metadata buffers.
-        self._fp8_prefill_enabled = True
+        self._fp8_prefill_enabled = MLA_FP8_PREFILL
         if self._fp8_prefill_enabled:
             # The PS metadata describes how to partition work for a single
             # prefill batch.  The max Q-length per request in any batch is
@@ -709,38 +711,124 @@ class ROCMAiterMLASparseMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> ROCMAiterMLASparseMetadata:
-        super_metadata = super().build(
+        if not self._fp8_prefill_enabled:
+            num_tokens = common_attn_metadata.num_actual_tokens
+            starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+            seg_lengths = np.diff(starts)
+            req_id_per_token = np.repeat(
+                np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+            )
+            # Zero-fill for cudagraphs
+            self.req_id_per_token_buffer.fill_(0)
+            self.paged_kv_indices.fill_(0)
+            self.paged_kv_indptr.fill_(0)
+            self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+                torch.from_numpy(req_id_per_token), non_blocking=True
+            )
+            query_lens = (
+                common_attn_metadata.query_start_loc[1:]
+                - common_attn_metadata.query_start_loc[:-1]
+            )
+            seq_lens = common_attn_metadata.seq_lens
+            sparse_seqlen = generate_sparse_seqlen_triton(
+                query_lens,
+                seq_lens,
+                common_attn_metadata.query_start_loc,
+                self.topk_tokens,
+                num_tokens,
+                common_attn_metadata.max_query_len,
+            )
+
+            torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
+            self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
+
+            req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+            qo_indptr = self.qo_indptr[: num_tokens + 1]
+            paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+            paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+            paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+
+            # ----- Compute persistent MLA metadata -----
+            # The aiter sparse decode kernel uses qseqlen=1 (each query token is
+            # treated as its own batch entry), so persistent metadata can always
+            # be precomputed here. The kernel switches to the persistent
+            # work-stealing path automatically when work_meta_data is non-None.
+            from aiter import get_mla_metadata_v1
+
+            get_mla_metadata_v1(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                self._num_attention_heads,
+                1,
+                True,
+                self._mla_work_meta_data,
+                self._mla_work_info_set,
+                self._mla_work_indptr,
+                self._mla_reduce_indptr,
+                self._mla_reduce_final_map,
+                self._mla_reduce_partial_map,
+                page_size=1,
+                kv_granularity=16,
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=True,
+            )
+            metadata = ROCMAiterMLASparseMetadata(
+                num_reqs=common_attn_metadata.num_reqs,
+                max_query_len=common_attn_metadata.max_query_len,
+                max_seq_len=common_attn_metadata.max_seq_len,
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                slot_mapping=common_attn_metadata.slot_mapping,
+                block_table=common_attn_metadata.block_table_tensor,
+                req_id_per_token=req_id_per_token,
+                block_size=self.kv_cache_spec.block_size,
+                attn_out_dtype=self.model_dtype,
+                topk_tokens=self.topk_tokens,
+                qo_indptr=qo_indptr,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_indptr=paged_kv_indptr,
+                work_meta_data=self._mla_work_meta_data,
+                work_indptr=self._mla_work_indptr,
+                work_info_set=self._mla_work_info_set,
+                reduce_indptr=self._mla_reduce_indptr,
+                reduce_final_map=self._mla_reduce_final_map,
+                reduce_partial_map=self._mla_reduce_partial_map,
+            )
+        else:
+            super_metadata = super().build(
                 common_prefix_len, common_attn_metadata, fast_build
             )
-        
-        metadata = ROCMAiterMLASparseMetadata(
-            num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            block_table=common_attn_metadata.block_table_tensor,
-            req_id_per_token=super_metadata.decode.req_id_per_token if super_metadata.decode is not None else None,
-            block_size=self.kv_cache_spec.block_size,
-            attn_out_dtype=self.model_dtype,
-            topk_tokens=self.topk_tokens,
-            qo_indptr=super_metadata.decode.qo_indptr if super_metadata.decode is not None else None,
-            paged_kv_last_page_len=super_metadata.decode.paged_kv_last_page_len if super_metadata.decode is not None else None,
-            paged_kv_indices=super_metadata.decode.paged_kv_indices if super_metadata.decode is not None else None,
-            paged_kv_indptr=super_metadata.decode.paged_kv_indptr if super_metadata.decode is not None else None,
-            work_meta_data=self._mla_work_meta_data,
-            work_indptr=self._mla_work_indptr,
-            work_info_set=self._mla_work_info_set,
-            reduce_indptr=self._mla_reduce_indptr,
-            reduce_final_map=self._mla_reduce_final_map,
-            reduce_partial_map=self._mla_reduce_partial_map,
-        )
-        metadata.prefill = super_metadata.prefill
-        metadata.num_decodes = super_metadata.num_decodes
-        metadata.num_prefills = super_metadata.num_prefills
-        metadata.num_decode_tokens = super_metadata.num_decode_tokens
-        metadata.decode = super_metadata.decode
+            metadata = ROCMAiterMLASparseMetadata(
+                num_reqs=common_attn_metadata.num_reqs,
+                max_query_len=common_attn_metadata.max_query_len,
+                max_seq_len=common_attn_metadata.max_seq_len,
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                slot_mapping=common_attn_metadata.slot_mapping,
+                block_table=common_attn_metadata.block_table_tensor,
+                req_id_per_token=super_metadata.decode.req_id_per_token if super_metadata.decode is not None else None,
+                block_size=self.kv_cache_spec.block_size,
+                attn_out_dtype=self.model_dtype,
+                topk_tokens=self.topk_tokens,
+                qo_indptr=super_metadata.decode.qo_indptr if super_metadata.decode is not None else None,
+                paged_kv_last_page_len=super_metadata.decode.paged_kv_last_page_len if super_metadata.decode is not None else None,
+                paged_kv_indices=super_metadata.decode.paged_kv_indices if super_metadata.decode is not None else None,
+                paged_kv_indptr=super_metadata.decode.paged_kv_indptr if super_metadata.decode is not None else None,
+                work_meta_data=self._mla_work_meta_data,
+                work_indptr=self._mla_work_indptr,
+                work_info_set=self._mla_work_info_set,
+                reduce_indptr=self._mla_reduce_indptr,
+                reduce_final_map=self._mla_reduce_final_map,
+                reduce_partial_map=self._mla_reduce_partial_map,
+            )
+            metadata.prefill = super_metadata.prefill
+            metadata.num_decodes = super_metadata.num_decodes
+            metadata.num_prefills = super_metadata.num_prefills
+            metadata.num_decode_tokens = super_metadata.num_decode_tokens
+            metadata.decode = super_metadata.decode
 
         if self._fp8_prefill_enabled and metadata.prefill is not None:
             self._build_fp8_prefill_ps_metadata(metadata)
@@ -818,7 +906,7 @@ class ROCMAiterMLASparseImpl(AiterMLAImpl):
         self._decode_out = None
 
         # FP8 MLA prefill kernel imports (lazy, only when enabled).
-        self._fp8_prefill_enabled = True
+        self._fp8_prefill_enabled = MLA_FP8_PREFILL
         if self._fp8_prefill_enabled:
             from aiter import mla_prefill_ps_asm_fwd, mla_reduce_v1
 
@@ -867,8 +955,6 @@ class ROCMAiterMLASparseImpl(AiterMLAImpl):
             v = v.to(fp8_dtype)
 
         one_scale = torch.ones((), dtype=torch.float32, device=q.device)
-
-        reduce_partial_map = attn_metadata.fp8_prefill_reduce_partial_map
 
         # The actual number of active partial tiles for this batch is stored
         # in reduce_indptr[-1].  Using reduce_partial_map.size(0) instead
@@ -987,7 +1073,7 @@ class ROCMAiterMLASparseImpl(AiterMLAImpl):
         )
 
         # Handle v_head_dim padding if present.
-        output_prefill = output_prefill[..., : v.shape[-1]]
+        #output_prefill = output_prefill[..., : v.shape[-1]]
 
         output.copy_(output_prefill.flatten(start_dim=-2))
 
@@ -1022,11 +1108,6 @@ class ROCMAiterMLASparseImpl(AiterMLAImpl):
                 reduce_indptr=attn_metadata.reduce_indptr,
                 reduce_final_map=attn_metadata.reduce_final_map,
                 reduce_partial_map=attn_metadata.reduce_partial_map,
-            )
-        # Probably unnecessary?
-        if kv_c_and_k_pe_cache.shape[1] != 1:
-            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.reshape(
-                -1, 1, kv_c_and_k_pe_cache.shape[-1]
             )
 
         rocm_aiter_ops.mla_decode_fwd(
@@ -1065,7 +1146,7 @@ class ROCMAiterMLASparseImpl(AiterMLAImpl):
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
         triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.req_id_per_token,
             attn_metadata.block_table,
             topk_indices,
             attn_metadata.paged_kv_indptr,
