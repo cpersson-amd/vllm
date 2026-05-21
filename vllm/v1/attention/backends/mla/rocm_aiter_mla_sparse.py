@@ -492,7 +492,6 @@ class ROCMAiterMLASparseMetadataBuilder(
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> AiterMLADecodeMetadata:
         num_tokens = num_decode_tokens
-        #num_tokens = super_metadata.num_decode_tokens if self._fp8_prefill_enabled else common_attn_metadata.num_actual_tokens
         starts = np.asarray(query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
@@ -509,7 +508,6 @@ class ROCMAiterMLASparseMetadataBuilder(
             query_start_loc_device[1:]
             - query_start_loc_device[:-1]
         )
-        max_query_len = query_lens.max().item()
         seq_lens = seq_lens_device
         sparse_seqlen = generate_sparse_seqlen_triton(
             query_lens,
@@ -517,7 +515,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             query_start_loc_device,
             self.topk_tokens,
             num_tokens,
-            max_query_len,
+            self.max_query_len,
         )
 
         torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
@@ -564,7 +562,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
-            max_qo_len=max_query_len,
+            max_qo_len=self.max_query_len,
             attn_out_dtype=self.decode_attn_out_dtype,
             has_persistent_metadata=True,
         )
@@ -666,6 +664,7 @@ class ROCMAiterMLASparseMetadataBuilder(
                 reduce_partial_map=self._mla_reduce_partial_map,
             )
         else:
+            self.max_query_len = max_query_len=common_attn_metadata.max_query_len
             super_metadata = super().build(
                 common_prefix_len, common_attn_metadata, fast_build
             )
@@ -697,6 +696,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             metadata.num_prefills = super_metadata.num_prefills
             metadata.num_decode_tokens = super_metadata.num_decode_tokens
             metadata.decode = super_metadata.decode
+        return metadata
 
 
 # Take from
