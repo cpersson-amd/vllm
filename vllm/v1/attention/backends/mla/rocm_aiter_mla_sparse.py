@@ -371,6 +371,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         parallel_config = vllm_config.parallel_config
         self.device = device
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._fp8_prefill_enabled = MLA_FP8_PREFILL
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
@@ -382,31 +383,30 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.dummy_block_table = torch.empty(
             (1, 1), dtype=torch.int32, device=self.device
         )
-
+        max_buffer_size = vllm_config.scheduler_config.max_num_seqs if self._fp8_prefill_enabled else max_num_batched_tokens
         self.req_id_per_token_buffer = torch.empty(
-            (vllm_config.scheduler_config.max_num_batched_tokens,),
+            (max_buffer_size,),
             dtype=torch.int32,
             device=device,
         )
         self.qo_indptr = torch.arange(
-            0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
+            0, max_buffer_size + 1, dtype=torch.int32, device=device
         )
         self.paged_kv_last_page_len = torch.ones(
-            max_num_batched_tokens, dtype=torch.int32, device=device
+            max_buffer_size, dtype=torch.int32, device=device
         )
 
         # These two needs to be calculated in runtime,
         # but we still needs to prepare the buffer
         self.paged_kv_indices = torch.zeros(
-            [max_num_batched_tokens * self.topk_tokens],
+            [max_buffer_size * self.topk_tokens],
             dtype=torch.int32,
             device=device,
         )
         self.paged_kv_indptr = torch.zeros(
-            [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+            [max_buffer_size + 1], dtype=torch.int32, device=device
         )
         # Pre-allocate FP8 MLA prefill PS metadata buffers.
-        self._fp8_prefill_enabled = MLA_FP8_PREFILL
         if self._fp8_prefill_enabled:
             # The PS metadata describes how to partition work for a single
             # prefill batch.  The max Q-length per request in any batch is
@@ -452,7 +452,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
-            max_num_batched_tokens,
+            max_buffer_size,
             1,
             self._num_attention_heads,
             q_dtype,
