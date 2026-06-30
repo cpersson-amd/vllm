@@ -132,7 +132,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 2 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 2 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -149,7 +149,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 3 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 3 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -166,7 +166,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 4 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 4 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -183,7 +183,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 5 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 5 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -200,7 +200,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 6 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 6 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -217,7 +217,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 7 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 7 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
@@ -234,7 +234,7 @@ steps:
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-mi3xx-fp8-and-mixed.txt
 
-  - label: LM Eval Small Models (2xB200-2xMI300) 8 # TBD
+- label: LM Eval Small Models (2xB200-2xMI300) 8 # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
   agent_pool: mi300_2
