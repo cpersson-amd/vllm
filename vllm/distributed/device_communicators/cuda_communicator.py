@@ -21,6 +21,7 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
+from .aiter_quick_all_reduce import AiterQuickAllReduce
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
@@ -54,6 +55,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_flashinfer_allreduce = False
             use_flashinfer_pcie_ipc_allreduce = False
             use_aiter_allreduce = False
+            use_aiter_quick_reduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
@@ -70,12 +72,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_aiter_allreduce = use_custom_allreduce and bool(
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
+            use_aiter_quick_reduce = (
+                use_custom_allreduce and envs.VLLM_ROCM_USE_AITER_QUICK_REDUCE
+            )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_flashinfer_pcie_ipc_allreduce = use_flashinfer_pcie_ipc_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_aiter_quick_reduce = use_aiter_quick_reduce
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -104,6 +110,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
+        self.aiter_qr_comm: AiterQuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
@@ -155,7 +162,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Based on quickreduce (https://github.com/mk1-project/quickreduce).
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
-            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            if self.use_aiter_quick_reduce:
+                self.aiter_qr_comm = AiterQuickAllReduce(
+                    group=self.cpu_group, device=self.device
+                )
+            # AITER's QRInt4 and vLLM's QuickReduce are two implementations of
+            # the same two-shot quantized all-reduce, so only one is kept. Fall
+            # back when QRInt4 rules itself out (non-bf16 model, unsupported
+            # arch or world size, missing aiter.ops.flydsl).
+            if self.aiter_qr_comm is None or self.aiter_qr_comm.disabled:
+                self.aiter_qr_comm = None
+                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -244,6 +261,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
+            "AITER_QUICK_REDUCE",
             "QUICK_REDUCE",
             "AITER_CUSTOM",
             "CUSTOM",
@@ -282,6 +300,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
+        if self.aiter_qr_comm is not None and not self.aiter_qr_comm.disabled:
+            enabled_ar_backends.append("AITER_QUICK_REDUCE")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
@@ -320,6 +340,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
+        aiter_qr_comm = self.aiter_qr_comm
+        if (
+            aiter_qr_comm is not None
+            and not aiter_qr_comm.disabled
+            and aiter_qr_comm.should_quick_allreduce(input_)
+        ):
+            out = aiter_qr_comm.quick_all_reduce(input_)
+            assert out is not None
+            return out
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -621,6 +650,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.aiter_ar_comm is not None:
             self.aiter_ar_comm.close()
             self.aiter_ar_comm = None
+        if self.aiter_qr_comm is not None:
+            # Closed explicitly rather than left to __del__: QRInt4 owns raw HIP
+            # IPC mappings and synchronizes the device on teardown.
+            self.aiter_qr_comm.close()
+            self.aiter_qr_comm = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None

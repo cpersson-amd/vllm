@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_ROCM_USE_AITER_QUICK_REDUCE: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1261,6 +1262,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    # Use AITER's FlyDSL INT4 QuickReduce (`aiter.ops.flydsl.QRInt4`) instead of
+    # vLLM's built-in QuickReduce codecs on ROCm. bf16-only, gfx942/gfx950,
+    # TP in {2, 4, 8}. INT4 all-reduce is lossy, so this defaults to off.
+    "VLLM_ROCM_USE_AITER_QUICK_REDUCE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_QUICK_REDUCE", "False").lower() in ("true", "1")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
