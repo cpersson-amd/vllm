@@ -10,16 +10,24 @@ half):
     out  = gate * sigmoid(alpha * gate) * (up + beta)
 
 On ROCm the dense MLP and the native MXFP8 MoE (between its two GEMMs) fell back
-to a chain of elementwise PyTorch ops with fp32 intermediates: vLLM's shared
-``SiluAndMulWithClamp`` blanket-routes ROCm to ``forward_native``, and the MoE
-applies the activation inline in PyTorch. This Triton kernel collapses that into
-a single pass producing the ``[*, I]`` output directly, and computes in fp32
+to a chain of elementwise PyTorch ops with fp32 intermediates: the MoE applies
+the activation inline in PyTorch, and ``SiluAndMulWithClamp.forward_native`` used
+to run unfused for every ROCm model. This Triton kernel collapses that into a
+single pass producing the ``[*, I]`` output directly, and computes in fp32
 (rel ~1e-6 vs reference).
 
-Note: the vectorized ``torch.ops._C.silu_and_mul_with_clamp`` op IS built on
-ROCm and is ~1.2-2.2x faster in isolation, but the win is launch overhead that
-HIP graphs already eliminate — measured end-to-end throughput is identical
-(within noise), so we keep the fp32-accurate Triton kernel.
+``SiluAndMulWithClamp.forward_hip`` routes here, so this backs the activation for
+every ROCm consumer of that op (DeepSeek-V4, EXAONE-4, ...) as well as MiniMax-M3,
+which calls the wrappers directly.
+
+Note: the vectorized ``torch.ops._C.silu_and_mul_with_clamp`` op IS built on ROCm
+and is ~2x faster than this kernel in eager mode, but most of that gap is launch
+overhead that HIP graphs remove. Captured in a graph on gfx950 it is within noise
+up to [2048, 2I] (and this kernel is marginally ahead at decode shapes), pulling
+ahead only on large prefill activations (1.3x at [16384, 3072], 1.5x at
+[16384, 4096]). Since it rounds intermediates to bf16 (rel ~3e-3 vs ~1e-6 here)
+it costs accuracy wherever this activation feeds a quantizer, which is the common
+case, so we keep the fp32 Triton kernel.
 """
 
 import torch

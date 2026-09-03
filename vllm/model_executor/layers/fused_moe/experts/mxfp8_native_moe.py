@@ -298,9 +298,7 @@ def fused_moe_mxfp8_native(
     # round-trip to HBM. Bit-exact vs the unfused swiglu+quant chain on measured
     # MoE shapes, and ~1.2-1.9x faster on that step in isolation. (Not the #22
     # ``silu_and_mul_with_clamp`` op: it rounds intermediates to bf16, rel ~3e-3.)
-    # Lazy import: the amd.ops package pulls in the minimax_m3 platform dispatch,
-    # only resolvable after the model module finishes loading.
-    from vllm.models.minimax_m3.amd.ops import swiglu_oai_quantize_mxfp8
+    from vllm.model_executor.layers.fused_swiglu_oai import swiglu_oai_quantize_mxfp8
 
     # GEMM2: act (mxfp8) @ w2^T -> [M, H], weighted by topk_weights, then reduce.
     act_q, act_s = swiglu_oai_quantize_mxfp8(g1, alpha=alpha, beta=beta, limit=limit)

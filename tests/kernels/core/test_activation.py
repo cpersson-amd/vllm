@@ -312,6 +312,25 @@ def test_silu_and_mul_with_clamp(
     opcheck(torch.ops._C.silu_and_mul_with_clamp, (out_buf, x, swiglu_limit))
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm dispatch only")
+@torch.inference_mode()
+def test_silu_and_mul_with_clamp_rocm_dispatch() -> None:
+    """ROCm must reach the fused Triton kernel, not the elementwise chain.
+
+    The activation runs inside the opaque `moe_forward_shared` custom op, so
+    nothing downstream can fuse it: a bare `forward_native` here costs 7 kernel
+    launches and 7 HBM round-trips per layer.
+    """
+    from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+
+    config = VllmConfig(
+        compilation_config=CompilationConfig(custom_ops=["+silu_and_mul_with_clamp"])
+    )
+    with set_current_vllm_config(config):
+        layer = SiluAndMulWithClamp(7.0)
+    assert layer._forward_method == layer.forward_hip
+
+
 @pytest.mark.parametrize("linear_beta", [-1.0, 2.0])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @torch.inference_mode()

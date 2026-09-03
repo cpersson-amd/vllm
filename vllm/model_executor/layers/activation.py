@@ -229,11 +229,19 @@ class SiluAndMulWithClamp(CustomOp):
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if current_platform.is_rocm() or current_platform.is_xpu():
-            self._forward_method = self.forward_native
+        if current_platform.is_rocm():
+            # `forward_hip` runs a fused Triton pass instead of the vectorized
+            # HIP op, which rounds intermediates to bf16 (rel ~3e-3 vs ~1e-6)
+            # and so costs accuracy where this activation feeds a quantizer.
+            # Deliberately leaves `_forward_method` as CustomOp dispatched it:
+            # overwriting it here would also discard the compiled
+            # `forward_native` that a disabled custom op relies on to fuse.
+            from vllm.model_executor.layers.fused_swiglu_oai import swiglu_oai_split
+
+            self._swiglu_oai_split = swiglu_oai_split
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul_with_clamp
-        elif current_platform.is_cpu():
+        elif current_platform.is_xpu() or current_platform.is_cpu():
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -248,6 +256,11 @@ class SiluAndMulWithClamp(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self._swiglu_oai_split(
+            x, alpha=self.alpha, beta=self.beta, limit=self.swiglu_limit
+        )
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
