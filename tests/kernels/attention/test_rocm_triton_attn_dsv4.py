@@ -346,6 +346,170 @@ def test_paged_mqa_logits_do_not_contain_nan(monkeypatch) -> None:
     assert not torch.isnan(logits).any()
 
 
+@requires_split_decode_arch
+@pytest.mark.parametrize("next_n", [1, 2, 4])
+@pytest.mark.parametrize("lens_per_row", [False, True])
+@torch.inference_mode()
+def test_paged_mqa_logits_triton_causal_bounds(
+    monkeypatch, next_n, lens_per_row
+) -> None:
+    """The triton kernel derives each row's causal key count from seq_lens
+    itself, so check the written region against the expected bounds. Rows carry
+    lengths that are zero, mid-range, and past max_model_len to cover the clamp.
+    """
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    device = "cuda"
+    fp8_dtype = current_platform.fp8_dtype()
+    block_size, head_size, num_heads = 64, 128, 32
+    max_model_len = 256
+    # Wider than max_model_len/block_size so the block-table guard alone cannot
+    # stop an over-long row; only the seq_len clamp keeps the store in bounds.
+    max_blocks = max_model_len // block_size + 2
+    # The over-long request sits before a zero-length one so that a missing
+    # clamp shows up as finite cells spilling into a row that must stay -inf.
+    per_req_lens = [200, max_model_len + 32, 0, 65]
+    batch_size = len(per_req_lens)
+
+    class FakeWorkspaceManager:
+        """Hands back poisoned memory, mirroring the reused workspace the real
+        manager returns. The kernel no longer pads the row tail with -inf, so
+        NaN here marks every cell the kernel did not write."""
+
+        def get_simultaneous(self, *shapes_and_dtypes):
+            out = []
+            for shape, dtype in shapes_and_dtypes:
+                buf = torch.empty(shape, dtype=dtype, device=device)
+                buf.fill_(float("nan") if dtype.is_floating_point else -7)
+                out.append(buf)
+            return out
+
+    monkeypatch.setattr(mod, "current_workspace_manager", FakeWorkspaceManager)
+
+    num_blocks = batch_size * max_blocks
+    values = torch.randn(num_blocks, block_size, 1, head_size, device=device).to(
+        fp8_dtype
+    )
+    scales = (
+        torch.rand(num_blocks, block_size, 1, 1, device=device) * 0.5 + 0.5
+    ).float()
+    kv_cache = torch.empty(
+        num_blocks, block_size, 1, head_size + 4, dtype=torch.uint8, device=device
+    )
+    kv_cache[..., :head_size] = values.view(torch.uint8)
+    kv_cache[..., head_size:] = scales.view(torch.uint8)
+
+    q = torch.randn(batch_size, next_n, num_heads, head_size, device=device).to(
+        fp8_dtype
+    )
+    weights = torch.rand(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+    block_tables = (
+        torch.arange(num_blocks, dtype=torch.int32, device=device)
+        .reshape(batch_size, max_blocks)
+        .contiguous()
+    )
+
+    if lens_per_row:
+        # Native spec decode hands down per-(request, position) lengths.
+        rows = [
+            [max(0, c - next_n + n + 1) for n in range(next_n)] for c in per_req_lens
+        ]
+        context_lens = torch.tensor(rows, dtype=torch.int32, device=device)
+    else:
+        context_lens = torch.tensor(per_req_lens, dtype=torch.int32, device=device)
+
+    logits = mod.rocm_fp8_paged_mqa_logits_triton(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+
+    assert logits.shape == (batch_size * next_n, max_model_len)
+
+    expected = torch.zeros(batch_size * next_n, dtype=torch.long)
+    for b, ctx in enumerate(per_req_lens):
+        for n in range(next_n):
+            expected[b * next_n + n] = min(max(ctx - next_n + n + 1, 0), max_model_len)
+
+    written = torch.isfinite(logits).sum(dim=1).cpu()
+    assert torch.equal(written, expected), f"{written.tolist()} != {expected.tolist()}"
+    # The written cells must be exactly the causal prefix of each row: anything
+    # past it stays poisoned, which also proves the store never runs long.
+    prefix = torch.arange(max_model_len).unsqueeze(0) < expected.unsqueeze(1)
+    assert torch.equal(torch.isfinite(logits).cpu(), prefix)
+
+
+@requires_split_decode_arch
+@pytest.mark.parametrize("seq_lens", [[0, 7, 513, 1023], [1025, 2047, 3001, 4096]])
+@torch.inference_mode()
+def test_decode_topk_ignores_logits_past_seq_len(seq_lens) -> None:
+    """`rocm_fp8_paged_mqa_logits_triton` leaves each logits row's tail past
+    seq_len untouched, so the decode top-k must never read it. Poison the tail
+    with +inf, which would dominate the selection if it were read.
+
+    The kernels' output order is not deterministic (histogram atomics), so
+    compare the selected index set rather than the exact layout.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _get_aiter_top_k_kernel,
+        _launch_aiter_top_k_per_row_decode,
+    )
+
+    device = "cuda"
+    topk = 1024
+    max_model_len = 4096
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    rows = len(seq_lens)
+    poison_idx = -7
+
+    torch.manual_seed(0)
+    base = torch.rand(rows, max_model_len, device=device, dtype=torch.float32)
+    in_range = torch.arange(max_model_len, device=device).unsqueeze(0) < lens.view(
+        -1, 1
+    )
+
+    def logits_with_tail(tail: float) -> torch.Tensor:
+        buf = torch.full(
+            (rows, max_model_len), tail, device=device, dtype=torch.float32
+        )
+        buf[in_range] = base[in_range]
+        return buf
+
+    def run(fn) -> torch.Tensor:
+        results = []
+        for tail in (float("-inf"), float("inf"), float("nan")):
+            out = torch.full((rows, topk), poison_idx, dtype=torch.int32, device=device)
+            fn(logits_with_tail(tail), out)
+            # Nothing may point past its row's causal bound, and the kernel must
+            # write every slot (no poison sentinel left behind).
+            bound = lens.view(-1, 1).expand_as(out)
+            assert int(((out >= 0) & (out >= bound)).sum()) == 0
+            assert int((out == poison_idx).sum()) == 0
+            results.append(torch.sort(out.long(), dim=1).values)
+        assert torch.equal(results[0], results[1]), "+inf tail changed selection"
+        assert torch.equal(results[0], results[2]), "nan tail changed selection"
+        return results[0]
+
+    run(
+        lambda lg, out: torch.ops._C.top_k_per_row_decode(
+            lg, 1, lens, out, rows, lg.stride(0), lg.stride(1), topk
+        )
+    )
+
+    aiter_kernel = _get_aiter_top_k_kernel(
+        is_prefill=False,
+        compress_ratio=4,
+        num_rows=rows,
+        max_valid_seq_len=max_model_len,
+    )
+    if aiter_kernel is not None:
+        run(
+            lambda lg, out: _launch_aiter_top_k_per_row_decode(
+                aiter_kernel, lg, lens, out, topk
+            )
+        )
+
+
 @torch.inference_mode()
 def test_compute_global_topk_ragged_indices_and_indptr() -> None:
     from vllm.models.deepseek_v4.amd.rocm import (

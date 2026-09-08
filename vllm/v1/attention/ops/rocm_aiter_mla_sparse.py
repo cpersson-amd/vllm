@@ -584,9 +584,9 @@ def _fp8_paged_mqa_logits_decode_kernel(
     kv_val_ptr,  # fp8, block-flat: [num_blocks, block_size*(D+4)]
     kv_scale_ptr,  # fp32, block-flat: [num_blocks, block_size*(D+4)//4]
     weights_ptr,  # fp32 [B*NEXT_N, H]
-    row_seq_ptr,  # int32 [B*NEXT_N]  per-(b,n) causal valid-key count
+    ctx_lens_ptr,  # int32; [B*NEXT_N] if CTX_PER_ROW else [B]
     block_tables_ptr,  # int32 [B, max_blocks]
-    logits_ptr,  # fp32 [B*NEXT_N, max_model_len]  (pre-filled -inf)
+    logits_ptr,  # fp32 [B*NEXT_N, max_model_len]  (tail past seq_len is stale)
     stride_q_b,
     stride_q_n,
     stride_q_h,
@@ -596,12 +596,14 @@ def _fp8_paged_mqa_logits_decode_kernel(
     stride_bt_b,
     stride_logits_row,
     max_blocks,  # block_tables width; guards the block-table gather
+    max_model_len,  # logits width; caps seq_len so the per-row store stays in bounds
     NUM_HEADS: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # paged-cache page size
     BLOCK_KV: tl.constexpr,  # positions per tile; must divide BLOCK_SIZE
     N_SPLITS: tl.constexpr,  # KV-tile parallelism factor (grid dim 1)
     NEXT_N: tl.constexpr,  # query positions per batch (1 = decode; >1 = MTP verify)
+    CTX_PER_ROW: tl.constexpr,  # ctx_lens is already per-(b,n) rather than per-b
 ):
     # scale_region_off = block_size*D//4 needs D % 4 == 0 (D=128).
     tl.static_assert(HEAD_SIZE % 4 == 0)
@@ -610,7 +612,15 @@ def _fp8_paged_mqa_logits_decode_kernel(
     split = tl.program_id(1)
     b = row // NEXT_N
     n = row % NEXT_N
-    seq_len = tl.load(row_seq_ptr + row)
+    # Causal valid-key count for this (b, n). Derived here rather than in a
+    # host-side tensor: every program already knows its row, so materializing
+    # it would cost a clamp plus two dtype casts per decode step.
+    # MTP with per-batch lengths: query n sees keys [0, context - NEXT_N + n].
+    if CTX_PER_ROW:
+        seq_len = tl.load(ctx_lens_ptr + row)
+    else:
+        seq_len = tl.load(ctx_lens_ptr + b) - NEXT_N + n + 1
+    seq_len = tl.minimum(tl.maximum(seq_len, 0), max_model_len)
 
     h = tl.arange(0, NUM_HEADS)
     d = tl.arange(0, HEAD_SIZE)
@@ -677,22 +687,21 @@ def rocm_fp8_paged_mqa_logits_triton(
     kv_val = kv_flat.view(fp8_dtype)  # [num_blocks, block_size*(D+4)] fp8
     kv_scale = kv_flat.view(torch.float32)  # [num_blocks, block_size*(D+4)//4] fp32
 
-    # Per-(b,n) causal key count. MTP: query n sees keys [0, context-next_n+n].
-    cl = context_lens.reshape(-1).to(torch.int64)
-    if next_n > 1 and cl.numel() == batch_size:
-        n_idx = torch.arange(next_n, device=cl.device, dtype=torch.int64)
-        row_seq = cl.view(batch_size, 1) - next_n + n_idx[None, :] + 1
-        row_seq = row_seq.clamp_min(0).reshape(-1)
-    else:
-        row_seq = cl
-    # Clamp to the logits width so the per-row store can't run off the buffer.
-    row_seq = row_seq.clamp_(0, max_model_len).to(torch.int32)
+    # The kernel derives each row's causal key count itself; this is just a
+    # flatten (a view for contiguous seq_lens, so no kernel launch). When the
+    # lengths are per-batch and NEXT_N > 1, the kernel applies the MTP offset.
+    cl = context_lens.reshape(-1)
+    ctx_per_row = not (next_n > 1 and cl.numel() == batch_size)
 
     max_blocks = block_tables.shape[1]
     (out_logits,) = current_workspace_manager().get_simultaneous(
         ((batch_size * next_n, max_model_len), torch.float32),
     )
-    out_logits.fill_(float("-inf"))
+    # No -inf prefill: the kernel writes columns [0, row seq_len) of every row,
+    # and both decode top-k back ends (native top_k_per_row_decode and AITER's
+    # FlyDSL kernel) bound their scan by the same seq_lens, so the tail past
+    # seq_len is never read. Padding it would cost a full-workspace write per
+    # layer per step.
 
     # Memory-bound over the KV range: split each row's keys across programs so
     # few-row / long-context launches still fill the GPU. All terms are static
@@ -705,7 +714,7 @@ def rocm_fp8_paged_mqa_logits_triton(
         kv_val,
         kv_scale,
         weights,
-        row_seq,
+        cl,
         block_tables,
         out_logits,
         q_fp8.stride(0),
@@ -717,12 +726,14 @@ def rocm_fp8_paged_mqa_logits_triton(
         block_tables.stride(0),
         out_logits.stride(0),
         max_blocks,
+        max_model_len,
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_size,
         BLOCK_SIZE=block_size,
         BLOCK_KV=BLOCK_KV,
         N_SPLITS=N_SPLITS,
         NEXT_N=next_n,
+        CTX_PER_ROW=ctx_per_row,
         num_warps=4,
         num_stages=2,
     )
