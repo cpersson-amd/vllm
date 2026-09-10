@@ -85,13 +85,14 @@ def quant_bf16_to_mxfp4(
         scale = scale.view(torch.uint8).to(orig_device).contiguous()
         return packed, scale
 
-    packed, scale = _mxfp4_quant_mse_search(w, num_lower=scale_search)
+    packed, scale = _mxfp4_quant_mse_search(w, num_lower=scale_search, rtol=1e-6)
     return packed.to(orig_device).contiguous(), scale.to(orig_device).contiguous()
 
 
 def _mxfp4_quant_mse_search(
     w: torch.Tensor,
     num_lower: int,
+    rtol: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MSE-optimal MXFP4 re-quant with a per-block E8M0 clipping search.
 
@@ -127,7 +128,8 @@ def _mxfp4_quant_mse_search(
     e0 = torch.where(amax > _MXFP4_MAX * torch.exp2(e0), e0 + 1.0, e0)
     e0 = e0.clamp(-127.0, 127.0)
 
-    best_sse = torch.full((out, nb), float("inf"), device=x.device)
+    best_sse = torch.full((out, nb), float("inf"), dtype=torch.float64,
+                          device=x.device)
     best_codes = torch.zeros((out, nb, blk), dtype=torch.uint8, device=x.device)
     best_e = torch.zeros((out, nb), dtype=torch.float32, device=x.device)
 
@@ -138,9 +140,9 @@ def _mxfp4_quant_mse_search(
         codes = _f32_to_floatx_unpacked(scaled.reshape(-1).contiguous(), 2, 1)
         codes = codes.reshape(out, nb, blk)
         deq = lut[codes.long()] * scale  # dequantized bf16-domain reconstruction
-        sse = ((xb - deq) ** 2).sum(dim=-1)  # [out, nb]
-
-        improve = sse < best_sse
+        # float64 reduction: block is 32 elements so this is ~exact and stable.
+        sse = ((xb - deq).double() ** 2).sum(dim=-1)  # [out, nb]
+        improve = sse < best_sse * (1.0 - rtol)
         best_sse = torch.where(improve, sse, best_sse)
         best_e = torch.where(improve, ec, best_e)
         best_codes = torch.where(improve.unsqueeze(-1), codes, best_codes)
