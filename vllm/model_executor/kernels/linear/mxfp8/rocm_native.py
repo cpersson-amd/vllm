@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native MXFP8 linear GEMM for AMD CDNA4 (gfx950) via Triton ``tl.dot_scaled``.
+"""Native MXFP8 linear GEMM for AMD CDNA4 (gfx950).
 
-Consumes the FP8 E4M3 weights + E8M0 block scales directly (no dequant-to-BF16);
-activations are MXFP8-quantized per token. Uses the CDNA4 hardware microscaling
-matrix cores. ``dot_scaled`` tiles K by 128; a weight whose K is not a multiple
-of that is dequantized to BF16 once at load and served by a plain linear
-instead, since ``can_implement`` does not filter on K.
+Prefers AITER's small-M HIP GEMV when that kernel is present (decode-sized M),
+then Triton ``tl.dot_scaled``. Consumes FP8 E4M3 weights + E8M0 block scales
+directly (no dequant-to-BF16); activations are MXFP8-quantized per token.
+``dot_scaled`` tiles K by 128; a weight whose K is not a multiple of that is
+dequantized to BF16 once at load and served by a plain linear instead.
 """
 
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -22,6 +24,17 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+logger = init_logger(__name__)
+
+# Optional AITER small-M HIP GEMV (gfx950). The wrapper is expected to return
+# None outside its envelope (M, K alignment, >2 GB buffers, untuned cells).
+# AITER PR ROCm/aiter#3783; vLLM dispatch was previously attempted in
+# vllm-project/vllm#46063 (closed, MiniMax-only) and is generalized here.
+try:
+    from aiter.ops.smallm_gemm_mxfp8 import mxfp8_gemv as _aiter_smallm_gemv
+except ImportError:
+    _aiter_smallm_gemv = None
 
 
 @triton.jit
@@ -80,6 +93,30 @@ def _mxfp8_linear_kernel(
     )
 
 
+def _try_aiter_mxfp8_gemv(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """AITER HIP GEMV when the kernel is built and AITER linear is enabled.
+
+    Falls through to Triton ``tl.dot_scaled`` for prefill-sized M, missing
+    AITER, or any shape the wrapper rejects. ``is_linear_enabled()`` is None
+    when AITER is not on this platform.
+    """
+    if _aiter_smallm_gemv is None or not rocm_aiter_ops.is_linear_enabled():
+        return None
+    out = _aiter_smallm_gemv(x_q, x_scale, w, w_scale, out_dtype)
+    if out is not None:
+        logger.info_once(
+            "MXFP8 dense linear: using aiter small-M HIP GEMV instead of "
+            "Triton tl.dot_scaled."
+        )
+    return out
+
+
 def _mxfp8_dot_scaled_linear(
     x: torch.Tensor,  # [M, K] bf16/fp16
     w: torch.Tensor,  # [N, K] fp8 e4m3
@@ -88,6 +125,9 @@ def _mxfp8_dot_scaled_linear(
     M, K = x.shape
     N = w.shape[0]
     x_q, x_scale = mxfp8_e4m3_quantize(x)
+    aiter_out = _try_aiter_mxfp8_gemv(x_q, x_scale, w, w_scale, x.dtype)
+    if aiter_out is not None:
+        return aiter_out
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
     BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = _select_cfg(M, N, K)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
