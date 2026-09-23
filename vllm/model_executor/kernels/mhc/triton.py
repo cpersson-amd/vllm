@@ -142,6 +142,260 @@ def _hc_collapse_triton_fake(x: Tensor, pre_mix: Tensor) -> Tensor:
 
 
 @triton.jit
+def _hc_collapse_rmsnorm_kernel(
+    pre_ptr,
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    pre_stride_t: tl.constexpr,
+    pre_stride_m: tl.constexpr,
+    x_stride_t: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    eps,
+    RBLOCK: tl.constexpr,
+):
+    """Collapse the HC streams and RMSNorm the result without a round trip.
+
+    One program per token, since RMSNorm needs the whole collapsed row; the
+    unfused collapse can tile the hidden dim instead because it has no
+    row-wide reduction.
+    """
+    token_idx = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, RBLOCK)
+    mask = cols < hidden_size
+
+    acc = tl.zeros((RBLOCK,), dtype=tl.float32)
+    for mix_idx in tl.static_range(0, hc_mult):
+        pre = tl.load(pre_ptr + token_idx * pre_stride_t + mix_idx * pre_stride_m).to(
+            tl.float32
+        )
+        x = tl.load(
+            x_ptr + token_idx * x_stride_t + mix_idx * x_stride_m + cols * x_stride_h,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += pre * x
+
+    # Masked lanes are zero, so they drop out of the sum; the divisor is the
+    # real hidden size rather than the padded block.
+    rstd = tl.rsqrt(tl.sum(acc * acc, 0) / hidden_size + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        out_ptr + token_idx * out_stride_t + cols * out_stride_h,
+        (acc * rstd * w).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _collapse_rmsnorm_launch_config(hidden_size: int) -> tuple[int, int]:
+    rblock = triton.next_power_of_2(hidden_size)
+    num_warps = 1 if rblock <= 512 else (4 if rblock <= 4096 else 8)
+    return rblock, num_warps
+
+
+def hc_collapse_rmsnorm_triton(
+    x: Tensor, pre_mix: Tensor, norm_weight: Tensor, norm_eps: float
+) -> Tensor:
+    """Collapse BF16 residual streams and apply weighted RMSNorm."""
+    assert x.ndim == 3 and x.dtype == torch.bfloat16
+    num_tokens, hc_mult, hidden_size = x.shape
+    assert pre_mix.shape == (num_tokens, hc_mult)
+    assert pre_mix.dtype == torch.float32
+    assert norm_weight.shape == (hidden_size,)
+    out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device)
+    if num_tokens == 0:
+        return out
+
+    rblock, num_warps = _collapse_rmsnorm_launch_config(hidden_size)
+    _hc_collapse_rmsnorm_kernel[(num_tokens,)](
+        pre_mix,
+        x,
+        norm_weight,
+        out,
+        hidden_size,
+        hc_mult,
+        pre_mix.stride(0),
+        pre_mix.stride(1),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        out.stride(0),
+        out.stride(1),
+        norm_eps,
+        RBLOCK=rblock,
+        num_warps=num_warps,
+        # Preserve the separate FP32 multiply and sum in the Torch reference.
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def _hc_collapse_rmsnorm_triton_fake(
+    x: Tensor, pre_mix: Tensor, norm_weight: Tensor, norm_eps: float
+) -> Tensor:
+    return torch.empty(x.shape[0], x.shape[2], dtype=x.dtype, device=x.device)
+
+
+@triton.jit
+def _hc_collapse_rmsnorm_mxfp8_kernel(
+    pre_ptr,
+    x_ptr,
+    w_ptr,
+    q_ptr,
+    s_ptr,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    pre_stride_t: tl.constexpr,
+    pre_stride_m: tl.constexpr,
+    x_stride_t: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    s_stride_t: tl.constexpr,
+    s_stride_b: tl.constexpr,
+    eps,
+    NUM_BLOCKS: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    TINY: tl.constexpr,
+):
+    """Collapse, RMSNorm, and MXFP8-quantize a token in one pass.
+
+    The row is carried as ``[NUM_BLOCKS, 32]`` so the per-block amax the E8M0
+    scale needs is an axis-1 reduction over the same registers that hold the
+    normalized value.
+    """
+    token_idx = tl.program_id(0).to(tl.int64)
+    blocks = tl.arange(0, NUM_BLOCKS)
+    lanes = tl.arange(0, 32)
+    cols = blocks[:, None] * 32 + lanes[None, :]
+    mask = cols < hidden_size
+
+    acc = tl.zeros((NUM_BLOCKS, 32), dtype=tl.float32)
+    for mix_idx in tl.static_range(0, hc_mult):
+        pre = tl.load(pre_ptr + token_idx * pre_stride_t + mix_idx * pre_stride_m).to(
+            tl.float32
+        )
+        x = tl.load(
+            x_ptr + token_idx * x_stride_t + mix_idx * x_stride_m + cols * x_stride_h,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += pre * x
+
+    rstd = tl.rsqrt(tl.sum(tl.sum(acc * acc, 1), 0) / hidden_size + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = acc * rstd * w
+
+    # Same scale derivation as the standalone MXFP8 quantizer: put the block
+    # amax at the top of the e4m3 range, and scale by a reciprocal so an
+    # all-zero block's 2**-127 divisor cannot flush to zero and yield NaN.
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), TINY)
+    sb = tl.ceil(tl.log2(amax / FP8_MAX)) + 127.0
+    sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
+    rescale = tl.exp2(127.0 - sb)
+
+    tl.store(
+        q_ptr + token_idx * q_stride_t + cols * q_stride_h,
+        (y * rescale[:, None]).to(q_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        s_ptr + token_idx * s_stride_t + blocks * s_stride_b,
+        sb.to(tl.uint8),
+        mask=blocks < hidden_size // 32,
+    )
+
+
+def hc_collapse_rmsnorm_mxfp8_triton(
+    x: Tensor, pre_mix: Tensor, norm_weight: Tensor, norm_eps: float
+) -> tuple[Tensor, Tensor]:
+    """Collapse, RMSNorm, and MXFP8-quantize, returning row-major E8M0 scales.
+
+    Equivalent to ``hc_collapse_rmsnorm_triton`` followed by
+    ``mxfp8_e4m3_quantize`` in its non-swizzled layout, in one launch.
+    """
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+
+    assert x.ndim == 3 and x.dtype == torch.bfloat16
+    num_tokens, hc_mult, hidden_size = x.shape
+    assert pre_mix.shape == (num_tokens, hc_mult)
+    assert pre_mix.dtype == torch.float32
+    assert norm_weight.shape == (hidden_size,)
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0
+    x_q = torch.empty(
+        num_tokens, hidden_size, dtype=MXFP8_VALUE_DTYPE, device=x.device
+    )
+    x_scale = torch.empty(
+        num_tokens,
+        hidden_size // MXFP8_BLOCK_SIZE,
+        dtype=MXFP8_SCALE_DTYPE,
+        device=x.device,
+    )
+    if num_tokens == 0:
+        return x_q, x_scale
+
+    rblock, num_warps = _collapse_rmsnorm_launch_config(hidden_size)
+    _hc_collapse_rmsnorm_mxfp8_kernel[(num_tokens,)](
+        pre_mix,
+        x,
+        norm_weight,
+        x_q,
+        x_scale,
+        hidden_size,
+        hc_mult,
+        pre_mix.stride(0),
+        pre_mix.stride(1),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x_q.stride(0),
+        x_q.stride(1),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        norm_eps,
+        NUM_BLOCKS=rblock // MXFP8_BLOCK_SIZE,
+        FP8_MAX=float(torch.finfo(MXFP8_VALUE_DTYPE).max),
+        TINY=float(torch.finfo(torch.float32).tiny),
+        num_warps=num_warps,
+        enable_fp_fusion=False,
+    )
+    return x_q, x_scale
+
+
+def _hc_collapse_rmsnorm_mxfp8_triton_fake(
+    x: Tensor, pre_mix: Tensor, norm_weight: Tensor, norm_eps: float
+) -> tuple[Tensor, Tensor]:
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+
+    num_tokens, _, hidden_size = x.shape
+    return (
+        torch.empty(
+            num_tokens, hidden_size, dtype=MXFP8_VALUE_DTYPE, device=x.device
+        ),
+        torch.empty(
+            num_tokens,
+            hidden_size // MXFP8_BLOCK_SIZE,
+            dtype=MXFP8_SCALE_DTYPE,
+            device=x.device,
+        ),
+    )
+
+
+@triton.jit
 def _mhc_pre_mix_kernel(
     gemm_ptr,
     sqrsum_ptr,
@@ -346,4 +600,20 @@ direct_register_custom_op(
     op_func=mhc_pre_mix_triton,
     mutates_args=[],
     fake_impl=_mhc_pre_mix_triton_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="hc_collapse_rmsnorm_triton",
+    op_func=hc_collapse_rmsnorm_triton,
+    mutates_args=[],
+    fake_impl=_hc_collapse_rmsnorm_triton_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="hc_collapse_rmsnorm_mxfp8_triton",
+    op_func=hc_collapse_rmsnorm_mxfp8_triton,
+    mutates_args=[],
+    fake_impl=_hc_collapse_rmsnorm_mxfp8_triton_fake,
 )

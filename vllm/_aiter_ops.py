@@ -1809,6 +1809,8 @@ def _mhc_delayed_pre_tail(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Finish a delayed mHC pre once AITER has produced the projection.
 
@@ -1816,6 +1818,8 @@ def _mhc_delayed_pre_tail(
     which kernel computes ``gemm_out`` / ``sqrsum`` and the residual they
     project. ``mhc_pre_big_fuse`` also writes a collapse against its own
     pre-mix, which the delayed formulation cannot use and so discards.
+    ``norm_weight`` folds the sublayer's RMSNorm into the collapse, which is
+    the only stage here wide enough to reduce over the hidden dim anyway.
     Returns ``(post_mix, comb_mix, layer_input, next_pre_mix)``.
     """
     from aiter.ops.mhc import mhc_pre_big_fuse
@@ -1861,6 +1865,14 @@ def _mhc_delayed_pre_tail(
     if pre_mix is None:
         # Model entry selects residual stream zero.
         layer_input = residual[:, 0]
+        if norm_weight is not None:
+            from vllm import ir
+
+            layer_input = ir.ops.rms_norm(layer_input, norm_weight, norm_eps)
+    elif norm_weight is not None:
+        layer_input = torch.ops.vllm.hc_collapse_rmsnorm_triton(
+            residual, pre_mix, norm_weight, norm_eps
+        )
     else:
         layer_input = torch.ops.vllm.hc_collapse_triton(residual, pre_mix)
     return post_mix, comb_mix, layer_input, next_pre_mix
@@ -3891,6 +3903,8 @@ class rocm_aiter_ops:
         post_layer_mix: torch.Tensor | None = None,
         comb_res_mix: torch.Tensor | None = None,
         residual_out: torch.Tensor | None = None,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """MHC pre using the pre-mix carried from the previous sublayer.
 
@@ -3913,6 +3927,9 @@ class rocm_aiter_ops:
         ``residual_out``, which the caller must supply in that case; it is an
         output buffer rather than a return value so the op never has to hand
         back one of its own inputs on the unfused path.
+
+        Passing ``norm_weight`` folds the sublayer's RMSNorm into the collapse
+        so the normalized layer input never round-trips through HBM.
 
         Returns:
             post_mix: shape (..., hc_mult, 1), dtype torch.float32
@@ -4015,6 +4032,8 @@ class rocm_aiter_ops:
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
         )
 
         return (

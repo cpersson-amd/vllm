@@ -388,14 +388,14 @@ class MHCPreDelayedOp(CustomOp):
         post_layer_mix: torch.Tensor | None = None,
         comb_res_mix: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The AITER delayed path drives mhc_pre_gemm_sqrsum against `residual`
-        # and folds no RMSNorm, so it cannot serve the model-entry broadcast
-        # (which projects a narrower `x`) or a fused norm. Both are handled by
-        # TileLang, or by the reference when TileLang is unavailable.
-        if (
-            x is None
-            and norm_weight is None
-            and _aiter_mhc_supported(residual, None, supports_norm=False)
+        # The AITER delayed path drives mhc_pre_gemm_sqrsum against `residual`,
+        # so it cannot serve the model-entry broadcast, which projects a
+        # narrower `x`; TileLang handles that, or the reference when TileLang
+        # is unavailable. A fused norm is fine here regardless of what the
+        # installed AITER supports, since the delayed collapse that carries it
+        # is our own kernel rather than an AITER epilogue.
+        if x is None and _aiter_mhc_supported(
+            residual, norm_weight, supports_norm=True
         ):
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -431,6 +431,8 @@ class MHCPreDelayedOp(CustomOp):
                 post_layer_mix,
                 comb_res_mix,
                 residual_out,
+                norm_weight,
+                norm_eps,
             )
             return (residual if residual_out is None else residual_out), *rest
         residual = self._maybe_post(

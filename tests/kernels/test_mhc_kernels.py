@@ -22,7 +22,10 @@ from vllm.model_executor.kernels.mhc.torch import (
     mhc_post_torch,
     mhc_pre_delayed_torch,
 )
-from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
+from vllm.model_executor.kernels.mhc.triton import (
+    hc_collapse_rmsnorm_triton,
+    hc_collapse_triton,
+)
 from vllm.model_executor.layers.mhc import (
     HAS_AITER_MHC,
     HAS_AITER_MHC_FUSED,
@@ -141,6 +144,102 @@ def test_hc_collapse_custom_op_supports_compile():
     x = torch.randn(2, 4, 5120, dtype=torch.bfloat16, device=DEVICE)
     pre = torch.rand(2, 4, device=DEVICE)
     torch.library.opcheck(torch.ops.vllm.hc_collapse_triton.default, (x, pre))
+
+
+def _collapse_rmsnorm_reference(
+    x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Collapse and normalize entirely in FP32, as the fused kernel does."""
+    acc = (pre.unsqueeze(-1) * x.float()).sum(dim=1)
+    rstd = torch.rsqrt(acc.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return acc * rstd * weight.float()
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hc_mult,hidden_size",
+    [(0, 4, 5120), (1, 4, 5120), (33, 4, 5120), (7, 8, 5137), (2, 1, 512)],
+)
+def test_hc_collapse_rmsnorm_matches_collapse_then_norm(
+    num_tokens, hc_mult, hidden_size
+):
+    """Folding the norm in must not drift from collapsing and norming apart."""
+    set_random_seed(0)
+    x = torch.randn(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=DEVICE
+    )
+    pre = torch.rand(num_tokens, hc_mult, device=DEVICE)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    eps = 1e-6
+
+    actual = hc_collapse_rmsnorm_triton(x, pre, weight, eps)
+    assert actual.shape == (num_tokens, hidden_size)
+    assert actual.dtype == torch.bfloat16
+    if not num_tokens:
+        return
+
+    expected = _collapse_rmsnorm_reference(x, pre, weight, eps).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1.6e-2, rtol=1e-2)
+
+    # The unfused pipeline rounds the collapse to BF16 before normalizing, so
+    # it is the looser comparison of the two.
+    collapsed = hc_collapse_triton(x, pre).float()
+    rstd = torch.rsqrt(collapsed.pow(2).mean(dim=-1, keepdim=True) + eps)
+    sequential = (collapsed * rstd * weight.float()).to(torch.bfloat16)
+    torch.testing.assert_close(actual, sequential, atol=3.2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="non-swizzled MXFP8 scales are the ROCm ABI"
+)
+@pytest.mark.parametrize("num_tokens,hidden_size", [(1, 5120), (33, 5120), (8, 2048)])
+def test_hc_collapse_rmsnorm_mxfp8_matches_quantized_norm(num_tokens, hidden_size):
+    """The fused quant must land on the same MXFP8 grid as the separate pass."""
+    from vllm.model_executor.kernels.mhc.triton import (
+        hc_collapse_rmsnorm_mxfp8_triton,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+        dequant_mxfp8_to_bf16,
+    )
+
+    set_random_seed(0)
+    hc_mult = 4
+    x = torch.randn(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=DEVICE
+    )
+    # An all-zero token exercises the scale floor that would otherwise divide
+    # by a subnormal and produce NaN.
+    x[0].zero_()
+    pre = torch.rand(num_tokens, hc_mult, device=DEVICE)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    eps = 1e-6
+
+    got_q, got_s = hc_collapse_rmsnorm_mxfp8_triton(x, pre, weight, eps)
+    assert got_s.shape == (num_tokens, hidden_size // 32)
+    assert not torch.isnan(got_q.float()).any()
+
+    ref_q, ref_s = _mxfp8_e4m3_quantize_torch(
+        _collapse_rmsnorm_reference(x, pre, weight, eps), is_sf_swizzled_layout=False
+    )
+    # Both derive the scale the same way; allow a one-step difference where an
+    # amax sits on an exact power of two.
+    assert (got_s.int() - ref_s.int()).abs().max().item() <= 1
+    torch.testing.assert_close(
+        dequant_mxfp8_to_bf16(got_q, got_s).float(),
+        dequant_mxfp8_to_bf16(ref_q, ref_s).float(),
+        atol=1e-2,
+        rtol=0.13,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_hc_collapse_rmsnorm_custom_op_supports_compile():
+    x = torch.randn(2, 4, 5120, dtype=torch.bfloat16, device=DEVICE)
+    pre = torch.rand(2, 4, device=DEVICE)
+    weight = torch.randn(5120, dtype=torch.bfloat16, device=DEVICE)
+    torch.library.opcheck(
+        torch.ops.vllm.hc_collapse_rmsnorm_triton.default, (x, pre, weight, 1e-6)
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")

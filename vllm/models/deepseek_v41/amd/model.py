@@ -289,6 +289,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_post_alpha,
                     self.hc_sinkhorn_iters,
                     x=x,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
             else:
                 residual = x
@@ -303,6 +305,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_post_alpha,
                     self.hc_sinkhorn_iters,
                     pre_mix=pre_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
         else:
             pre_args = (
@@ -328,7 +332,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     engram_mask,
                 )
                 residual, post_mix, res_mix, x, attn_pre = self.mhc_pre_delayed(
-                    residual, *pre_args, pre_mix=pre_mix
+                    residual,
+                    *pre_args,
+                    pre_mix=pre_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
             else:
                 (
@@ -344,8 +352,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     sublayer_out=x,
                     post_layer_mix=post_mix,
                     comb_res_mix=res_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
                 )
-        x = self.attn_norm(x)
 
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
@@ -368,8 +377,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             sublayer_out=x,
             post_layer_mix=post_mix,
             comb_res_mix=res_mix,
+            norm_weight=self.ffn_norm.weight,
+            norm_eps=self.ffn_norm.variance_epsilon,
         )
-        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix, ffn_pre
 
