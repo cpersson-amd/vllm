@@ -427,6 +427,54 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def _all_reduce_selects_aiter(self, input_: torch.Tensor) -> bool:
+        """Whether ``all_reduce(input_)`` dispatches to AITER custom allreduce.
+
+        Must follow the backend order in ``all_reduce``.
+        """
+        aiter_ar_comm = self.aiter_ar_comm
+        if (
+            not self.use_aiter_allreduce
+            or aiter_ar_comm is None
+            or aiter_ar_comm.disabled
+        ):
+            return False
+        fi_ar_comm = self.fi_ar_comm
+        use_fi_ar = (
+            fi_ar_comm is not None
+            and not fi_ar_comm.disabled
+            and fi_ar_comm.should_use_fi_ar(input_)
+        )
+        if use_fi_ar:
+            return False
+        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
+            self.pynccl_comm.world_size, input_
+        ):
+            return False
+        qr_comm = self.qr_comm
+        if (
+            qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce(input_)
+        ):
+            return False
+        fi_pcie_ipc_ar_comm = self.fi_pcie_ipc_ar_comm
+        if fi_pcie_ipc_ar_comm is not None and fi_pcie_ipc_ar_comm.should_use(input_):
+            return False
+        return aiter_ar_comm.should_custom_ar(input_)
+
+    def all_reduce_add(self, input_: torch.Tensor, addend: torch.Tensor) -> torch.Tensor:
+        aiter_ar_comm = self.aiter_ar_comm
+        if (
+            self._all_reduce_selects_aiter(input_)
+            and aiter_ar_comm is not None
+            and aiter_ar_comm.should_custom_ar_add(input_, addend)
+        ):
+            out = aiter_ar_comm.custom_all_reduce_add(input_, addend)
+            assert out is not None
+            return out
+        return self.all_reduce(input_ + addend)
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:

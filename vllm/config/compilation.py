@@ -141,6 +141,11 @@ class PassConfig:
     """Enable async TP."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
+    fuse_allreduce_add: bool = None  # type: ignore[assignment]
+    """Fold an elementwise add into the all-reduce that consumes it, e.g. the
+    shared + routed expert add in front of the MoE all-reduce. Runs after the
+    allreduce + RMSNorm fusion. Without compilation, the MoE layer calls the
+    fused all-reduce + add directly."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
     """Enable fused Q/K RMSNorm + RoPE pass."""
     fuse_rope_kvcache_cat_mla: bool = None  # type: ignore[assignment]
@@ -234,6 +239,7 @@ class PassConfig:
         "enable_sp",
         "fuse_gemm_comms",
         "fuse_allreduce_rms",
+        "fuse_allreduce_add",
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
@@ -272,6 +278,11 @@ class PassConfig:
                 logger.warning_once(
                     "Fusion enabled but reshape elimination disabled. "
                     "RMSNorm + padding fusion might not work"
+                )
+            if self.fuse_allreduce_add:
+                logger.warning_once(
+                    "Fusion enabled but reshape elimination disabled. "
+                    "Allreduce + add fusion might not work"
                 )
         if self.enable_qk_norm_rope_fusion and not (
             current_platform.is_cuda_alike() or current_platform.is_xpu()

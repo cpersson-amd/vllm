@@ -232,6 +232,11 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_reduce_add(self, input_: torch.Tensor, addend: torch.Tensor) -> torch.Tensor:
+        """All-reduce of ``input_ + addend``. Backends that can fold the add
+        into the collective override this."""
+        return self.all_reduce(input_ + addend)
+
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 

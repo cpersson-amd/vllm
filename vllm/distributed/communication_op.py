@@ -14,6 +14,13 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_add(
+    input_: torch.Tensor, addend: torch.Tensor
+) -> torch.Tensor:
+    """All-reduce ``input_ + addend`` across model parallel group."""
+    return get_tp_group().all_reduce_add(input_, addend)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import set_env_var
 
+from .fusion.allreduce_add_fusion import AllReduceAddFusionPass
 from .ir.clone_elimination import UnsafeCloneEliminationPass
 from .ir.lowering_pass import VllmIRLoweringPass
 from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -176,6 +177,10 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
                     self.passes += [AllReduceFusionPass(config)]
+
+            if self.pass_config.fuse_allreduce_add:
+                # After AR+RMS, which removes more work where it matches.
+                self.passes += [AllReduceAddFusionPass(config)]
 
             if enable_transformers_norm_canonicalization:
                 # Let AR+RMS match before moving output reshapes ahead of the

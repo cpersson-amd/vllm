@@ -13,6 +13,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_add,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
@@ -477,19 +478,7 @@ class MoERunner(MoERunnerInterface):
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced
 
-    def _maybe_reduce_final_output(
-        self,
-        states: torch.Tensor,
-        trunc_size: int | None,
-        output_is_reduced: bool | None = None,
-    ) -> torch.Tensor:
-        """All-reduce the combined output if needed.
-
-        This is the "late" all-reduce path. When neither fused nor shared
-        output was individually reduced, the combined sum is all-reduced
-        here. Skipped when sequence-parallel is active (SP handles its
-        own reduction) or when the early path already reduced both outputs.
-        """
+    def _should_reduce_final_output(self, output_is_reduced: bool | None) -> bool:
         # skip_final_all_reduce must not coexist with a pre-reduced fused
         # output. This should be enforced by MoE config initialization.
         if self.moe_config.skip_final_all_reduce:
@@ -503,12 +492,27 @@ class MoERunner(MoERunnerInterface):
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
 
-        if (
+        return (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
-        ):
+        )
+
+    def _maybe_reduce_final_output(
+        self,
+        states: torch.Tensor,
+        trunc_size: int | None,
+        output_is_reduced: bool | None = None,
+    ) -> torch.Tensor:
+        """All-reduce the combined output if needed.
+
+        This is the "late" all-reduce path. When neither fused nor shared
+        output was individually reduced, the combined sum is all-reduced
+        here. Skipped when sequence-parallel is active (SP handles its
+        own reduction) or when the early path already reduced both outputs.
+        """
+        if self._should_reduce_final_output(output_is_reduced):
             states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
@@ -781,6 +785,19 @@ class MoERunner(MoERunnerInterface):
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
+
+        if (
+            shared_output is not None
+            and not torch.compiler.is_compiling()
+            and self._should_reduce_final_output(fused_output_is_reduced)
+        ):
+            # Under torch.compile the fuse_allreduce_add pass does this, after
+            # allreduce + RMSNorm fusion has had the chance to claim the
+            # all-reduce instead.
+            result = tensor_model_parallel_all_reduce_add(shared_output, fused_output)
+            if og_hidden_dim_post_xform is not None:
+                result = result[..., :og_hidden_dim_post_xform]
+            return self._maybe_add_zero_expert_output(result)
 
         if shared_output is not None:
             result = shared_output + fused_output

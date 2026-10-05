@@ -54,6 +54,17 @@ class AiterCustomAllreduce:
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
         return self._impl.custom_all_reduce(inp)
 
+    def should_custom_ar_add(self, inp: torch.Tensor, addend: torch.Tensor) -> bool:
+        if not self.build_supports_all_reduce_add():
+            return False
+        return self._impl.should_custom_ar_add(inp, addend)
+
+    def custom_all_reduce_add(
+        self, inp: torch.Tensor, addend: torch.Tensor
+    ) -> torch.Tensor | None:
+        """All-reduce of ``inp + addend`` without a separate add kernel."""
+        return self._impl.custom_all_reduce_add(inp, addend)
+
     def should_custom_ag(self, inp: torch.Tensor) -> bool:
         return self._impl.should_custom_ag(inp)
 
@@ -134,6 +145,15 @@ class AiterCustomAllreduce:
         )
 
         return hasattr(_AiterCustomAllreduce, "fused_ar_rms_per_group_quant")
+
+    @staticmethod
+    def build_supports_all_reduce_add() -> bool:
+        """True if the running AITER build exposes ``all_reduce_add``."""
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as _AiterCustomAllreduce,
+        )
+
+        return hasattr(_AiterCustomAllreduce, "all_reduce_add")
 
     # TODO(frida-andersson): drop once vLLM pins AITER >= 0.1.14 (ROCm/aiter#2823).
     @property

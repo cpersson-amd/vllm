@@ -202,6 +202,21 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
+def enable_allreduce_add_fusion(cfg: "VllmConfig") -> bool:
+    """Enable if TP > 1 and AITER custom allreduce, which can fold the add,
+    is in use."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return (
+        bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
+        and cfg.parallel_config.tensor_parallel_size > 1
+    )
+
+
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
@@ -257,6 +272,7 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_norm_quant": False,
             "fuse_act_quant": False,
             "fuse_allreduce_rms": False,
+            "fuse_allreduce_add": False,
             "fuse_attn_quant": False,
             "enable_sp": False,
             "fuse_gemm_comms": False,
@@ -280,6 +296,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": False,
+            "fuse_allreduce_add": False,
             "fuse_attn_quant": False,
             "enable_sp": False,
             "fuse_gemm_comms": False,
@@ -303,6 +320,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
+            "fuse_allreduce_add": enable_allreduce_add_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,
@@ -326,6 +344,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
+            "fuse_allreduce_add": enable_allreduce_add_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,

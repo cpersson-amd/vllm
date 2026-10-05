@@ -205,6 +205,22 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def all_reduce_add(
+    tensor: torch.Tensor, addend: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_add_out_place(tensor, addend)
+
+
+def all_reduce_add_fake(
+    tensor: torch.Tensor, addend: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -397,6 +413,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_add",
+    op_func=all_reduce_add,
+    fake_impl=all_reduce_add_fake,
 )
 
 direct_register_custom_op(
@@ -746,6 +768,27 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def all_reduce_add(self, input_: torch.Tensor, addend: torch.Tensor) -> torch.Tensor:
+        """All-reduce of ``input_ + addend``. Backends that can fold the add
+        into the collective save the separate add kernel; the others add first.
+        """
+        if self.world_size == 1:
+            return input_ + addend
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce_add(
+                input_, addend, group_name=self.unique_name
+            )
+        else:
+            return self._all_reduce_add_out_place(input_, addend)
+
+    def _all_reduce_add_out_place(
+        self, input_: torch.Tensor, addend: torch.Tensor
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_add(input_, addend)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
