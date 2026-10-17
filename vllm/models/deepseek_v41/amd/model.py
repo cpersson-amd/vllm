@@ -269,6 +269,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         # attn_norm / ffn_norm into its collapse, so the separate norms are
         # skipped for the seams it takes.
         self.fuse_seam_norm = HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM
+        if self.fuse_seam_norm and vllm_config.kernel_config.enable_jit_warmup:
+            from vllm.model_executor.kernels.mhc.warmup import (
+                AITER_MHC_FUSED_POST_PRE_DELAYED_KERNEL,
+            )
+
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            if self.use_sequence_parallel:
+                tp_size = vllm_config.parallel_config.tensor_parallel_size
+                max_tokens = cdiv(max_tokens, tp_size)
+            AITER_MHC_FUSED_POST_PRE_DELAYED_KERNEL.register_warmup(
+                max_tokens=max_tokens,
+                hidden_size=self.hidden_size,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
         # Decode steps of an eligible layer may run as the mono decode layer.
         self.mono = MonoDecodeLayer.create(self, vllm_config)
         if self.mono is not None and self.mono.ffn_only:

@@ -51,8 +51,10 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    SPARSE_ATTN_PREFILL_RAGGED_KERNEL,
     build_prefill_topk_ragged_indices,
     build_ragged_indices_from_dense,
+    register_mxfp8_wo_a_bmm_warmup,
     rocm_inv_rope_einsum,
     rocm_inverse_rope_mxfp8_rows,
     rocm_inverse_rope_rows_,
@@ -571,6 +573,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         # so retain the ordinary MXFP8 linear kernel for post-load processing
         # instead of asking for the CUDA-only BMM kernel.
         self.wo_a.is_bmm = False
+        self._max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self._has_kv_transfer = vllm_config.kv_transfer_config is not None
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
@@ -599,6 +604,15 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "are not supported."
                 )
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
+        if (
+            not self._use_aiter_sparse_mla
+            and vllm_config.kernel_config.enable_jit_warmup
+        ):
+            SPARSE_ATTN_PREFILL_RAGGED_KERNEL.register_warmup(
+                num_heads=self.n_local_heads,
+                head_dim=self.head_dim,
+                has_attn_sink=True,
+            )
         if self.compressor is None and self.indexer is None:
             # Dense layers have nothing to overlap; keep the base serial path.
             self.aux_stream_list = None
@@ -606,6 +620,16 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # The wo_a scale layout is final only once its linear has processed it.
+        if _ON_GFX950:
+            register_mxfp8_wo_a_bmm_warmup(
+                self.wo_a,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self._max_num_batched_tokens,
+            )
 
     def prepare_attn_preshuffle(self) -> None:
         from vllm._aiter_ops import rocm_aiter_ops

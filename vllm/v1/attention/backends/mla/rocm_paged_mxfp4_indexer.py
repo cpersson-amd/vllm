@@ -31,6 +31,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV41IndexerBackend,
 )
 from vllm.v1.attention.ops.rocm_paged_mxfp4_indexer import (
+    ROCM_MXFP4_PREFILL_LOGITS_KERNEL,
+    ROCM_MXFP4_PREFILL_MASK_KERNEL,
     build_rocm_mxfp4_decode_schedule,
     rocm_mxfp4_consumer_rows,
     rocm_mxfp4_decode_schedule_words,
@@ -491,6 +493,21 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(RocmMxfp4IndexerMetadataBuilder
                 _GATHER_MIN_CUT_DECODE,
                 _GATHER_MIN_CUT_PREFILL,
             )
+        if vllm_config.kernel_config.enable_jit_warmup:
+            # The cache is bound by the time the warmup reads its page stride.
+            ROCM_MXFP4_PREFILL_LOGITS_KERNEL.register_warmup(
+                vllm_config=vllm_config,
+                k_cache_prefix=layer_names[0],
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                block_table_width=self.expanded_block_table_buffer.shape[1],
+                max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+                candidate_block_size=self.candidate_block_size,
+            )
+            if self.candidate_block_size:
+                ROCM_MXFP4_PREFILL_MASK_KERNEL.register_warmup(
+                    candidate_block_size=self.candidate_block_size
+                )
 
     def _gather_pays(self, context: int, cut: float) -> bool:
         return self.num_candidate_cols > 0 and context >= cut * self.num_candidate_cols

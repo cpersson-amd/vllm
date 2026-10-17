@@ -140,7 +140,7 @@ def _handle_jit_event(
     logger.warning_once(message, *args)
 
 
-def _safe_repr(value: object, *, max_len: int = 120) -> str:
+def _safe_repr(value: object, *, max_len: int = 4000) -> str:
     try:
         text = repr(value)
     except Exception:

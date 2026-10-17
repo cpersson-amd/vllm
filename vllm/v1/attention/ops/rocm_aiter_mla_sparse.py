@@ -4,7 +4,9 @@ import functools
 import importlib
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from importlib.util import find_spec
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +16,12 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, WarmupIntRange
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
@@ -1827,6 +1835,83 @@ def _mxfp8_wo_a_bmm_config(num_tokens: int, n_groups: int) -> tuple[int, ...]:
     return 128, 128, 128, 4, 2
 
 
+def _mxfp8_wo_a_bmm_warmup_inputs(
+    *,
+    n_groups: int,
+    o_lora_rank: int,
+    group_dim: int,
+    scale_rows: int,
+    max_num_tokens: int,
+) -> dict[str, object]:
+    num_tokens: Any = WarmupIntRange(1, max_num_tokens + 1)
+    width = n_groups * group_dim
+    rows = n_groups * o_lora_rank
+    return dict(
+        a=TritonWarmupTensor(torch.float8_e4m3fn, shape=(num_tokens, width)),
+        a_scale=TritonWarmupTensor(torch.uint8, shape=(num_tokens, width // 32)),
+        weight=TritonWarmupTensor(torch.float8_e4m3fn, shape=(rows, group_dim)),
+        weight_scale=TritonWarmupTensor(
+            torch.uint8, shape=(rows // scale_rows, group_dim // 32)
+        ),
+        out=TritonWarmupTensor(torch.bfloat16, shape=(num_tokens, rows)),
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_mxfp8_wo_a_bmm_kernel,
+    warmup_inputs=_mxfp8_wo_a_bmm_warmup_inputs,
+)
+def _mxfp8_wo_a_bmm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    n_groups: int,
+    o_lora_rank: int,
+) -> DispatchSpec:
+    num_tokens = a.shape[0]
+    block_m, block_n, block_k, num_warps, num_stages = _mxfp8_wo_a_bmm_config(
+        num_tokens, n_groups
+    )
+    grid = (n_groups * o_lora_rank // block_n, triton.cdiv(num_tokens, block_m))
+    return grid, dict(
+        as_ptr=a_scale,
+        w_ptr=weight,
+        ws_ptr=weight_scale,
+        num_tokens=num_tokens,
+        stride_at=a.stride(0),
+        stride_ast=a_scale.stride(0),
+        stride_wn=weight.stride(0),
+        stride_wsn=weight_scale.stride(0),
+        stride_out=out.stride(0),
+        R=o_lora_rank,
+        K=a.shape[1] // n_groups,
+        SCALE_ROWS=weight.shape[0] // weight_scale.shape[0],
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def register_mxfp8_wo_a_bmm_warmup(
+    wo_a: torch.nn.Module, n_groups: int, o_lora_rank: int, max_num_tokens: int
+) -> None:
+    """Register the token-count tiers of `rocm_mxfp8_wo_a_bmm` for ``wo_a``'s
+    processed weight."""
+    _mxfp8_wo_a_bmm.register_warmup(
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        group_dim=wo_a.weight.shape[1],
+        scale_rows=wo_a.weight.shape[0] // wo_a.weight_scale.shape[0],
+        max_num_tokens=max_num_tokens,
+    )
+
+
 def _rocm_mxfp8_wo_a_bmm_impl(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -1836,37 +1921,12 @@ def _rocm_mxfp8_wo_a_bmm_impl(
     o_lora_rank: int,
 ) -> torch.Tensor:
     num_tokens = a.shape[0]
-    group_dim = a.shape[1] // n_groups
     out = torch.empty(
         (num_tokens, n_groups * o_lora_rank), dtype=torch.bfloat16, device=a.device
     )
     if num_tokens == 0:
         return out
-    block_m, block_n, block_k, num_warps, num_stages = _mxfp8_wo_a_bmm_config(
-        num_tokens, n_groups
-    )
-    grid = (n_groups * o_lora_rank // block_n, triton.cdiv(num_tokens, block_m))
-    _mxfp8_wo_a_bmm_kernel[grid](
-        a,
-        a_scale,
-        weight,
-        weight_scale,
-        out,
-        num_tokens,
-        a.stride(0),
-        a_scale.stride(0),
-        weight.stride(0),
-        weight_scale.stride(0),
-        out.stride(0),
-        R=o_lora_rank,
-        K=group_dim,
-        SCALE_ROWS=weight.shape[0] // weight_scale.shape[0],
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    _mxfp8_wo_a_bmm(a, a_scale, weight, weight_scale, out, n_groups, o_lora_rank)
     return out
 
 
@@ -1949,7 +2009,7 @@ def _validate_dsv4_sparse_dims(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows_limit", "num_queries"])
 def _count_valid_row_entries_kernel(
     indices_ptr,
     lengths_ptr,
@@ -1990,7 +2050,7 @@ def _count_valid_row_entries_kernel(
     tl.store(counts_ptr + rows, acc, mask=row_ok)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows_limit"])
 def _compact_dense_row_to_ragged_kernel(
     indices_ptr,
     lengths_ptr,
@@ -2102,7 +2162,7 @@ def _sparse_kv_row_offset(slot, stride):
     return slot.to(tl.int64) * stride
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv"])
 def _sparse_attn_prefill_ragged_kernel(
     q_ptr,
     kv_ptr,
@@ -3516,10 +3576,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
-    block_h = 16
-    block_d = triton.next_power_of_2(head_dim)
-    block_k = 16 if head_dim >= 256 else 32
-    num_warps = 4
     if out is None:
         out = torch.empty_like(q)
     else:
@@ -3529,7 +3585,31 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         assert out.shape[-1] in (nope_head_dim, head_dim), (
             f"expected out width {nope_head_dim} or {head_dim}, got {out.shape[-1]}"
         )
-    _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+    _launch_sparse_attn_prefill_ragged(
+        q, kv, indices, indptr, attn_sink, has_attn_sink, out, scale
+    )
+    return out
+
+
+def _launch_sparse_attn_prefill_ragged(
+    q: Any,
+    kv: Any,
+    indices: Any,
+    indptr: Any,
+    attn_sink: Any,
+    has_attn_sink: bool,
+    out: Any,
+    scale: float,
+    compile_only: bool = False,
+) -> None:
+    num_queries, num_heads, head_dim = q.shape
+    block_h = 16
+    grid = (num_queries, triton.cdiv(num_heads, block_h))
+    kernel = _sparse_attn_prefill_ragged_kernel
+    launch = (
+        functools.partial(kernel.warmup, grid=grid) if compile_only else kernel[grid]
+    )
+    launch(
         q,
         kv,
         indices,
@@ -3551,11 +3631,61 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         HAS_ATTN_SINK=has_attn_sink,
         OUT_DV=out.shape[-1],
         BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_K=16 if head_dim >= 256 else 32,
+        num_warps=4,
     )
-    return out
+
+
+class SparseAttnPrefillRaggedKernel(
+    VllmJitKernel["SparseAttnPrefillRaggedKernel.CompileKey"]
+):
+    """Compiles the Triton sparse prefill for one layer geometry. Its KV, and
+    on the MXFP8-output path its output, are views into the shared workspace,
+    whose size decides how Triton specializes their pointers on ROCm."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        num_heads: int
+        head_dim: int
+        has_attn_sink: bool
+        out_in_workspace: bool
+
+    def get_warmup_keys(
+        self, *, num_heads: int, head_dim: int, has_attn_sink: bool
+    ) -> list[CompileKey]:
+        return [
+            self.CompileKey(num_heads, head_dim, has_attn_sink, out_in_workspace)
+            for out_in_workspace in (False, True)
+        ]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        heads, head_dim = compile_key.num_heads, compile_key.head_dim
+        bf16 = torch.bfloat16
+        (workspace,) = current_workspace_manager().get_simultaneous(
+            ((1, head_dim), bf16)
+        )
+        storage_bytes = workspace.untyped_storage().size()
+        q = TritonWarmupTensor(bf16, shape=(1, heads, head_dim))
+        out = TritonWarmupTensor(
+            bf16,
+            shape=(1, heads, head_dim),
+            storage_bytes=storage_bytes if compile_key.out_in_workspace else 0,
+        )
+        _launch_sparse_attn_prefill_ragged(
+            q,
+            TritonWarmupTensor(bf16, shape=(1, head_dim), storage_bytes=storage_bytes),
+            TritonWarmupTensor(torch.int32, shape=(1,)),
+            TritonWarmupTensor(torch.int32, shape=(2,)),
+            TritonWarmupTensor(torch.float32, shape=(heads,)),
+            compile_key.has_attn_sink,
+            out,
+            1.0,
+            compile_only=True,
+        )
+
+
+SPARSE_ATTN_PREFILL_RAGGED_KERNEL = SparseAttnPrefillRaggedKernel()
 
 
 def _rocm_sparse_attn_prefill_triton(

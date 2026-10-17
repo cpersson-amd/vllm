@@ -23,7 +23,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
-from .rocm_block32_gemm import BLOCK_ROWS, rocm_mxfp8_block32_gemm
+from .rocm_block32_gemm import (
+    BLOCK32_GEMM_KERNEL,
+    BLOCK_ROWS,
+    rocm_mxfp8_block32_gemm,
+)
 
 
 @triton.jit
@@ -256,6 +260,7 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
             # back from the loader expanded per row; keep the blocks and use
             # the block-scaled GEMM, which also handles any K % 32 == 0.
             weight_scale = block_scale
+            BLOCK32_GEMM_KERNEL.register_warmup(n=N, k=K, out_dtype=layer.params_dtype)
         elif K % _DOT_SCALED_K_ALIGN != 0:
             weight = dequant_mxfp8_to_bf16(weight.contiguous(), weight_scale)
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)

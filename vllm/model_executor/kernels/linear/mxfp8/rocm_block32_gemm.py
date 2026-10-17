@@ -46,10 +46,14 @@ The packed kernel and the in-launch split-K reduction on one XCD
 adapted from the group32 GEMM in ROCm/aiter#5750.
 """
 
+import functools
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -593,15 +597,29 @@ def _k_partition(K: int, splits: int, step: int) -> tuple[int, int]:
 
 
 def _launch(
-    x: torch.Tensor,
-    x_scale: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    out: torch.Tensor,
+    x: torch.Tensor | TritonWarmupTensor,
+    x_scale: torch.Tensor | TritonWarmupTensor,
+    weight: torch.Tensor | TritonWarmupTensor,
+    weight_scale: torch.Tensor | TritonWarmupTensor,
+    out: torch.Tensor | TritonWarmupTensor,
     cfg: _Config,
+    compile_only: bool = False,
 ) -> None:
+    """Launch the GEMM, or with ``compile_only`` compile the launches it would
+    make for these (compile-only) operands."""
     M, K = x.shape
     N = weight.shape[0]
+
+    def empty(shape: tuple[int, ...], dtype: torch.dtype):
+        if compile_only:
+            return TritonWarmupTensor(dtype, shape=shape)
+        return torch.empty(shape, dtype=dtype, device=out.device)
+
+    def kernel_at(kernel, grid: tuple[int, ...]):
+        if compile_only:
+            return functools.partial(kernel.warmup, grid=grid)
+        return kernel[grid]
+
     opts = dict(
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
@@ -615,24 +633,20 @@ def _launch(
     k_per_split, splits = _k_partition(K, splits, step)
     counters = None
     if cfg.fused_splits > 1 and splits > 1 and tiles <= _SPLIT_COUNTERS:
-        counters = _split_counters(out.device)
+        counters = (
+            empty((_SPLIT_COUNTERS,), torch.int32)
+            if compile_only
+            else _split_counters(out.device)
+        )
     if counters is not None:
         fused = splits
         target = out
-        slots = torch.empty(
-            tiles * fused * cfg.block_m * cfg.block_n,
-            dtype=torch.float32,
-            device=out.device,
-        )
+        slots = empty((tiles * fused * cfg.block_m * cfg.block_n,), torch.float32)
         grid: tuple[int, ...] = (triton.cdiv(tiles, _XCD_STRIDE) * _XCD_STRIDE * fused,)
     else:
         # Without counters, split K through a second launch.
         fused = 1
-        target = (
-            out
-            if splits == 1
-            else torch.empty((splits, M, N), dtype=torch.float32, device=x.device)
-        )
+        target = out if splits == 1 else empty((splits, M, N), torch.float32)
         slots = counters = target  # Unused by the kernels.
         if cfg.packed or not cfg.n_first:
             grid = (grid_m, grid_n, splits)
@@ -641,7 +655,7 @@ def _launch(
     args = (x, x_scale, weight, weight_scale, target, slots, counters, M, N, K)
     stride = out.stride(0) if splits == 1 or fused > 1 else N
     if cfg.packed:
-        _block32_packed_kernel[grid](
+        kernel_at(_block32_packed_kernel, grid)(
             *args,
             stride,
             BLOCK_M=cfg.block_m,
@@ -654,7 +668,7 @@ def _launch(
             **opts,
         )
     else:
-        _block32_tiled_kernel[grid](
+        kernel_at(_block32_tiled_kernel, grid)(
             *args,
             stride,
             BLOCK_M=cfg.block_m,
@@ -667,7 +681,9 @@ def _launch(
             **opts,
         )
     if fused == 1 and splits > 1:
-        _block32_splitk_reduce_kernel[(triton.cdiv(M, 32), triton.cdiv(N, 64))](
+        kernel_at(
+            _block32_splitk_reduce_kernel, (triton.cdiv(M, 32), triton.cdiv(N, 64))
+        )(
             target,
             out,
             M,
@@ -677,6 +693,49 @@ def _launch(
             BLOCK_M=32,
             BLOCK_N=64,
         )
+
+
+class Block32GemmKernel(VllmJitKernel["Block32GemmKernel.CompileKey"]):
+    """Compiles each launch configuration ``rocm_mxfp8_block32_gemm`` picks for
+    one weight shape. M only selects the tier: the kernels do not specialize
+    on it."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        n: int
+        k: int
+        out_dtype: torch.dtype
+        cfg: _Config
+        # A token count that selects cfg.
+        m: int = field(compare=False)
+
+    def get_warmup_keys(
+        self, *, n: int, k: int, out_dtype: torch.dtype
+    ) -> list[CompileKey]:
+        tiers = _TUNED.get((n, k))
+        bounds = [max_m for max_m, _ in tiers] if tiers else [8, 32, 256]
+        token_counts = sorted({1, *bounds, *(m + 1 for m in bounds)})
+        keys = {
+            self.CompileKey(n, k, out_dtype, _config(m, n, k), m): None
+            for m in token_counts
+        }
+        return list(keys)
+
+    def compile(self, compile_key: CompileKey) -> None:
+        m, n, k = compile_key.m, compile_key.n, compile_key.k
+        fp8 = torch.float8_e4m3fn
+        _launch(
+            TritonWarmupTensor(fp8, shape=(m, k)),
+            TritonWarmupTensor(torch.uint8, shape=(m, k // 32)),
+            TritonWarmupTensor(fp8, shape=(n, k)),
+            TritonWarmupTensor(torch.uint8, shape=(triton.cdiv(n, 32), k // 32)),
+            TritonWarmupTensor(compile_key.out_dtype, shape=(m, n)),
+            compile_key.cfg,
+            compile_only=True,
+        )
+
+
+BLOCK32_GEMM_KERNEL = Block32GemmKernel()
 
 
 def _rocm_mxfp8_block32_gemm_impl(

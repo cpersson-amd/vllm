@@ -14,19 +14,23 @@ them.
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    _mask_candidates_kernel,
     apply_candidate_mask,
 )
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     _apply_candidate_mask_strided,
     _max_decode_logits_rows,
@@ -395,7 +399,11 @@ def _dense_prefill(
 ) -> None:
     pa = _aiter()
     t0, t1 = chunk.token_start, chunk.token_end
-    logits = layer.q.new_empty((t1 - t0, plan.width), dtype=torch.float32)
+    # A row stride that is a multiple of 16 whatever the chunk's width keeps
+    # the candidate mask to the one specialization its warmup compiles.
+    logits = layer.q.new_empty(
+        (t1 - t0, round_up(plan.width, 16)), dtype=torch.float32
+    )[:, : plan.width]
     scores = None
     if candidate_write:
         nblocks = triton.cdiv(plan.width, layer.block)
@@ -428,6 +436,236 @@ def _dense_prefill(
         layer.topk_buffer[t0:t1, : layer.topk_tokens],
         layer.topk_tokens,
     )
+
+
+# The select_config fields the kernel compiles in; the rest only plan the grid.
+_PREFILL_CONFIG_FIELDS = (
+    "num_warps",
+    "num_buffers",
+    "waves_per_eu",
+    "depth",
+    "unroll",
+    "fold_asm",
+    "relu_add",
+    "relaxed_store",
+    "block_m",
+    "block_kv",
+    "n_per_tile",
+    "page_pipe",
+    "m_chunk",
+    "num_chains",
+)
+
+
+class RocmMxfp4PrefillLogitsKernel(
+    VllmJitKernel["RocmMxfp4PrefillLogitsKernel.CompileKey"]
+):
+    """Compiles aiter's paged MXFP4 MQA-logits kernel for every varlen launch
+    `_dense_prefill` can make on one cache. The launch plans its config from a
+    chunk's mean rows per request, and splits the KV walk or not depending on
+    the batch, so both are swept."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        num_heads: int
+        head_dim: int
+        page_size: int
+        page_stride: int
+        cache_within_2gb: bool
+        block_table_width: int
+        block_scores: bool
+        candidate_block_size: int
+        config: tuple[tuple[str, int], ...]
+        kv_reread: bool
+        has_kv_split: bool
+        # A mean rows per request that selects config.
+        next_n: int = field(compare=False)
+
+    def get_warmup_keys(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        k_cache_prefix: str,
+        num_heads: int,
+        head_dim: int,
+        block_table_width: int,
+        max_tokens: int,
+        candidate_block_size: int,
+    ) -> list[CompileKey]:
+        pa = _aiter()
+        forward_context = vllm_config.compilation_config.static_forward_context
+        kv_cache = forward_context[k_cache_prefix].kv_cache
+        page_size, page_stride, _ = pa.cache_strides(
+            _kv_view(kv_cache, head_dim), head_dim
+        )
+        cache_within_2gb = kv_cache.untyped_storage().size() < 2**31
+        keys: dict[RocmMxfp4PrefillLogitsKernel.CompileKey, None] = {}
+        for next_n in range(1, max_tokens + 1):
+            cfg = pa.select_config(
+                num_heads, head_dim, next_n, page_size, clean_logits=False
+            )
+            config = tuple((name, cfg[name]) for name in _PREFILL_CONFIG_FIELDS)
+            for block_scores in {False, bool(candidate_block_size)}:
+                for has_kv_split in (False, True):
+                    key = self.CompileKey(
+                        num_heads,
+                        head_dim,
+                        page_size,
+                        page_stride,
+                        cache_within_2gb,
+                        block_table_width,
+                        block_scores,
+                        candidate_block_size,
+                        config,
+                        cfg["row_blocks"] > 1,
+                        has_kv_split,
+                        next_n,
+                    )
+                    keys.setdefault(key, None)
+        return list(keys)
+
+    def compile(self, compile_key: CompileKey) -> None:
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits_mxfp4 import (  # noqa: E501
+            _pa_mqa_logits_mxfp4_kernel,
+        )
+
+        key = compile_key
+        cfg = dict(key.config)
+        rows, heads, head_dim = key.next_n, key.num_heads, key.head_dim
+        u8, i32, f32 = torch.uint8, torch.int32, torch.float32
+        q = TritonWarmupTensor(u8, shape=(rows, heads, head_dim // 2))
+        q_scales = TritonWarmupTensor(
+            u8, shape=(rows, heads, head_dim // MXFP4_BLOCK_SIZE)
+        )
+        storage_bytes = 0 if key.cache_within_2gb else 2**31
+        head_bytes = head_dim // 2
+        values = TritonWarmupTensor(
+            u8,
+            shape=(1, key.page_size * head_bytes),
+            strides=(key.page_stride, 1),
+            storage_bytes=storage_bytes,
+        )
+        scales = TritonWarmupTensor(
+            u8,
+            shape=(1, key.page_size * head_dim // MXFP4_BLOCK_SIZE),
+            strides=(key.page_stride, 1),
+            storage_bytes=storage_bytes,
+        )
+        weights = TritonWarmupTensor(f32, shape=(rows, heads))
+        context_lens = TritonWarmupTensor(i32, shape=(1,))
+        block_table = TritonWarmupTensor(i32, shape=(1, key.block_table_width))
+        logits = TritonWarmupTensor(f32, shape=(rows, 16))
+        block_scores = (
+            TritonWarmupTensor(f32, shape=(rows, 16)) if key.block_scores else None
+        )
+        _pa_mqa_logits_mxfp4_kernel.warmup(
+            Q_ptr=q,
+            q_scales_ptr=q_scales,
+            KV_ptr=values,
+            kv_scales_ptr=scales,
+            weights_ptr=weights,
+            context_lens_ptr=context_lens,
+            row_ends_ptr=TritonWarmupTensor(i32, shape=(rows,)),
+            query_start_loc_ptr=TritonWarmupTensor(i32, shape=(2,)),
+            block_table_ptr=block_table,
+            sched_ptr=context_lens,
+            slots_ptr=context_lens,
+            block_scores_ptr=block_scores,
+            logits_ptr=logits,
+            next_n=rows,
+            batch=1,
+            num_kv_splits=2 if key.has_kv_split else 1,
+            stride_q_b=0,
+            stride_q_n=q.stride(0),
+            stride_qs_b=0,
+            stride_qs_n=q_scales.stride(0),
+            stride_w_s=weights.stride(0),
+            stride_logits_s=logits.stride(0),
+            stride_logits_k=logits.stride(1),
+            stride_blk_b=block_table.stride(0),
+            stride_gather_r=0,
+            stride_bs_s=block_scores.stride(0) if block_scores is not None else None,
+            max_blocks=key.block_table_width,
+            NUM_HEADS=heads,
+            HEAD_SIZE=head_dim,
+            PAGE_SIZE=key.page_size,
+            KV_PAGE_STRIDE=key.page_stride,
+            KVS_PAGE_STRIDE=key.page_stride,
+            BLOCK_KV=cfg["block_kv"],
+            BLOCK_M=cfg["block_m"],
+            NUM_WARPS=cfg["num_warps"],
+            NUM_BUFFERS=cfg["num_buffers"],
+            DEPTH=cfg["depth"],
+            UNROLL=cfg["unroll"],
+            PAGE_PIPE=cfg["page_pipe"],
+            M_CHUNK=cfg["m_chunk"],
+            NUM_CHAINS=cfg["num_chains"],
+            FOLD_ASM=cfg["fold_asm"],
+            RELU_ADD=cfg["relu_add"],
+            RELAXED_STORE=cfg["relaxed_store"],
+            VARLEN=1,
+            PRESHUFFLE=1,
+            SCALE_MODE=_aiter().SCALE_MODE_WIDE,
+            USE_BUFFER_LOAD=True,
+            MFMA_NONK_DIM=cfg["n_per_tile"],
+            HAS_KV_SPLIT=int(key.has_kv_split),
+            KV_REREAD=int(key.kv_reread),
+            DYNAMIC=0,
+            HAS_ROW_ENDS=1,
+            GATHER=0,
+            GATHER_BLOCK=8,
+            GATHER_PIPE=0,
+            BSCORE=int(key.block_scores),
+            BSCORE_BLOCK=(
+                key.candidate_block_size
+                if key.block_scores
+                else _aiter().CANDIDATE_BLOCK
+            ),
+            num_warps=cfg["num_warps"],
+            waves_per_eu=cfg["waves_per_eu"],
+            enable_fp_fusion=True,
+            grid=(1, 1, 1),
+        )
+
+
+ROCM_MXFP4_PREFILL_LOGITS_KERNEL = RocmMxfp4PrefillLogitsKernel()
+
+
+class RocmMxfp4PrefillMaskKernel(
+    VllmJitKernel["RocmMxfp4PrefillMaskKernel.CompileKey"]
+):
+    """Compiles the candidate mask a consumer's dense prefill applies to its
+    logits."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        candidate_block_size: int
+
+    def get_warmup_keys(self, *, candidate_block_size: int) -> list[CompileKey]:
+        return [self.CompileKey(candidate_block_size)]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        logits = TritonWarmupTensor(torch.float32, shape=(1, 16))
+        _mask_candidates_kernel.warmup(
+            logits,
+            None,
+            TritonWarmupTensor(torch.int32, shape=(1,)),
+            TritonWarmupTensor(torch.uint8, shape=(1, 3)),
+            logits.stride(0),
+            logits.stride(1),
+            0,
+            1,
+            16,
+            2,
+            compile_key.candidate_block_size,
+            False,
+            1,
+            1024,
+            grid=(1, 1),
+        )
+
+
+ROCM_MXFP4_PREFILL_MASK_KERNEL = RocmMxfp4PrefillMaskKernel()
 
 
 def _dense_decode(layer: _Layer, logits_width: int, candidate_write: bool) -> None:

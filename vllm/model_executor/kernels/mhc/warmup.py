@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+import torch
 
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     compute_num_split,
     mhc_pre_big_fuse_with_norm_tilelang,
 )
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.math_utils import cdiv
@@ -99,3 +102,116 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
 
 
 MHC_PRE_NORM_KERNEL = MHCPreNormKernel()
+
+
+class AiterMHCFusedPostPreDelayedKernel(
+    VllmJitKernel["AiterMHCFusedPostPreDelayedKernel.CompileKey"]
+):
+    """Compiles aiter's ``mhc_fused_post_pre_delayed_rmsnorm`` main and reduce
+    kernels for every launch config its token-count table picks. The main
+    kernel also specializes on the token count (1, multiple of 16, other)."""
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        hidden_size: int
+        sinkhorn_repeat: int
+        has_post: bool
+        config: tuple[tuple[str, int], ...]
+        num_tokens_class: int
+        # A token count that selects config and num_tokens_class.
+        num_tokens: int = field(compare=False)
+
+    def get_warmup_keys(
+        self, *, max_tokens: int, hidden_size: int, sinkhorn_repeat: int
+    ) -> list[CompileKey]:
+        from aiter.ops.triton.utils.mhc_config_utils import (
+            get_mhc_fused_post_pre_delayed_rmsnorm_config,
+        )
+
+        keys: dict[AiterMHCFusedPostPreDelayedKernel.CompileKey, None] = {}
+        for num_tokens in range(1, max_tokens + 1):
+            config = tuple(
+                sorted(
+                    get_mhc_fused_post_pre_delayed_rmsnorm_config(num_tokens).items()
+                )
+            )
+            num_tokens_class = (
+                1 if num_tokens == 1 else 16 if num_tokens % 16 == 0 else 0
+            )
+            for has_post in (False, True):
+                key = self.CompileKey(
+                    hidden_size,
+                    sinkhorn_repeat,
+                    has_post,
+                    config,
+                    num_tokens_class,
+                    num_tokens,
+                )
+                keys.setdefault(key, None)
+        return list(keys)
+
+    def compile(self, compile_key: CompileKey) -> None:
+        from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (  # noqa: E501
+            _mhc_fused_post_pre_delayed_rmsnorm_main_kernel as main_kernel,
+        )
+        from aiter.ops.triton._triton_kernels.fusions.mhc_fused_post_pre_delayed_rmsnorm import (  # noqa: E501
+            _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel as reduce_kernel,
+        )
+
+        T, H = compile_key.num_tokens, compile_key.hidden_size
+        config = dict(compile_key.config)
+        bf16, fp32 = torch.bfloat16, torch.float32
+        residual = TritonWarmupTensor(bf16, shape=(T, 4, H))
+        if compile_key.has_post:
+            sublayer_out = TritonWarmupTensor(bf16, shape=(T, H))
+            post = TritonWarmupTensor(fp32, shape=(T, 4))
+            comb = TritonWarmupTensor(fp32, shape=(T, 4, 4))
+            residual_out = TritonWarmupTensor(bf16, shape=(T, 4, H))
+        else:
+            sublayer_out = post = comb = residual_out = residual
+        layer_input = TritonWarmupTensor(bf16, shape=(T, H))
+        partial = TritonWarmupTensor(fp32, shape=(T, config["NUM_KSPLIT"], 32))
+        main_kernel.warmup(
+            residual,
+            sublayer_out,
+            post,
+            comb,
+            TritonWarmupTensor(fp32, shape=(T, 4)),
+            TritonWarmupTensor(fp32, shape=(24, 4 * H)),
+            residual_out,
+            layer_input,
+            partial,
+            T,
+            H=H,
+            BLOCK_M=config["BLOCK_M"],
+            TILE_K=config["TILE_K"],
+            NUM_KSPLIT=config["NUM_KSPLIT"],
+            HAS_POST=compile_key.has_post,
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            grid=(1,),
+        )
+        reduce_kernel.warmup(
+            partial,
+            TritonWarmupTensor(fp32, shape=(3,)),
+            TritonWarmupTensor(fp32, shape=(24,)),
+            TritonWarmupTensor(fp32, shape=(T, 4)),
+            TritonWarmupTensor(fp32, shape=(T, 4, 1)),
+            TritonWarmupTensor(fp32, shape=(T, 4, 4)),
+            layer_input,
+            TritonWarmupTensor(bf16, shape=(H,)),
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            1e-6,
+            H=H,
+            NUM_KSPLIT=config["NUM_KSPLIT"],
+            NUM_SINKHORN_ITERS=compile_key.sinkhorn_repeat,
+            BLOCK_C=config["BLOCK_C"],
+            num_warps=config["reduce_num_warps"],
+            grid=(1,),
+        )
+
+
+AITER_MHC_FUSED_POST_PRE_DELAYED_KERNEL = AiterMHCFusedPostPreDelayedKernel()
