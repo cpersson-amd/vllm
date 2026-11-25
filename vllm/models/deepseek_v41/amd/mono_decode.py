@@ -228,15 +228,17 @@ def _capture_plain_experts(experts) -> None:
     qm.process_weights_after_loading = process_weights_after_loading
 
 
-def _keep_copies(layer, copies: tuple[torch.Tensor, ...]) -> None:
-    """Store a layer's gfx942 copies as `layer.mono942`. A reload of the
-    weights (`reload_weights`, or a weight update in RL) runs
+def _keep_copies(
+    layer, copies: tuple[torch.Tensor, ...], attr: str = "mono942"
+) -> None:
+    """Store a layer's copies as `layer.<attr>` (gfx942: `mono942`). A reload
+    of the weights (`reload_weights`, or a weight update in RL) runs
     `process_weights_after_loading` again, and the kernels and captured
     CUDA graphs read the first copies by their addresses. So the copies of a
     reload are written into the first copies in place."""
-    kept = getattr(layer, "mono942", None)
+    kept = getattr(layer, attr, None)
     if kept is None:
-        layer.mono942 = copies
+        setattr(layer, attr, copies)
         return
     for old, new in zip(kept, copies, strict=True):
         old.copy_(new)
@@ -298,14 +300,64 @@ def _copy_942_at_load(layer: "DeepseekV4DecoderLayer", ffn_only: bool) -> None:
         _copy_linear_at_load(linear)
 
 
+def _copy_checkpoint_at_load(linear) -> None:
+    """gfx950: an online method that requantizes the MXFP8 checkpoint
+    (`--quantization-config`) replaces the weights the kernels read, so keep
+    the checkpoint's row-major weight and 32 x 32 E8M0 block scales as
+    `layer.mono950` before it runs, as the MXFP8 kernel would have kept them.
+    The layerwise loader requantizes each layer as it loads, and the model
+    loader calls this again at the end; the first copies stay."""
+    from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
+        _as_block32_scale,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+    )
+
+    qm = linear.quant_method
+    original = qm.process_weights_after_loading
+
+    def process_weights_after_loading(layer):
+        if layer is not linear or getattr(
+            layer, "_already_called_process_weights_after_loading", False
+        ):
+            return original(layer)
+        weight = layer.weight.data
+        n, k = weight.shape
+        # The loader expands the checkpoint's block scales per row.
+        scale = layer.weight_scale.data[:n, : k // MXFP8_BLOCK_SIZE].contiguous()
+        block_scale = _as_block32_scale(scale)
+        copies = (
+            weight.contiguous().clone(),
+            _scale_bytes(scale if block_scale is None else block_scale).clone(),
+        )
+        out = original(layer)
+        _keep_copies(layer, copies, "mono950")
+        return out
+
+    qm.process_weights_after_loading = process_weights_after_loading
+
+
 def _keep_row_major_at_load(layer: "DeepseekV4DecoderLayer", ffn_only: bool) -> None:
     """gfx950: the kernels read these linears' weights row-major, so their kernel
-    keeps them and preshuffles a copy for AITER's GEMMs."""
+    keeps them and preshuffles a copy for AITER's GEMMs. Linears an online
+    method requantizes keep a copy of the checkpoint's instead."""
     sh = layer.ffn.shared_experts
     assert sh is not None
     attn = [] if ffn_only else [getattr(layer.attn, n) for n in ATTN_LINEARS_942]
     for linear in [sh.gate_up_proj, sh.down_proj, *attn]:
         linear.keep_row_major_weight = True
+        if getattr(linear.quant_method, "requantization_source", None) is not None:
+            _copy_checkpoint_at_load(linear)
+
+
+def _mxfp8(linear) -> tuple[torch.Tensor, torch.Tensor]:
+    """gfx950: a dense linear's MXFP8 weight and E8M0 scale bytes as the
+    kernels read them, the checkpoint's copies if it was requantized."""
+    kept = getattr(linear, "mono950", None)
+    if kept is not None:
+        return kept
+    return linear.weight, _scale_bytes(linear.weight_scale)
 
 
 def _compute_units() -> int:
@@ -573,6 +625,8 @@ class MonoDecodeLayer:
         if _on_gfx942():
             self._weights = self._weights_942(layer)
             return self._weights
+        sgu, sgu_s = _mxfp8(sh.gate_up_proj)
+        sw2, sw2_s = _mxfp8(sh.down_proj)
         self._weights = MonoLayerWeights(
             attn=None if self.ffn_only else self._attn_weights(a),
             hc_attn_fn=layer.hc_attn_fn,
@@ -589,10 +643,10 @@ class MonoDecodeLayer:
             w13_s=e.w13_weight_scale,
             w2=e.w2_weight,
             w2_s=e.w2_weight_scale,
-            sgu=sh.gate_up_proj.weight,
-            sgu_s=_scale_bytes(sh.gate_up_proj.weight_scale),
-            sw2=sh.down_proj.weight,
-            sw2_s=_scale_bytes(sh.down_proj.weight_scale),
+            sgu=sgu,
+            sgu_s=sgu_s,
+            sw2=sw2,
+            sw2_s=sw2_s,
         )
         self._weights.check(get_tensor_model_parallel_world_size(), self.experts)
         return self._weights
@@ -663,18 +717,21 @@ class MonoDecodeLayer:
         from vllm.models.deepseek_v41.amd.mono.attention.plan import Dims
         from vllm.models.deepseek_v41.amd.mono.runner import AttnWeights
 
+        wqkv, wq_b, wo_a, wo_b = (
+            _mxfp8(getattr(a, name)) for name in ATTN_LINEARS_942
+        )
         attn = AttnWeights(
             layer_id=a.layer_id,
-            wqkv=a.fused_wqa_wkv.weight,
-            wqkv_scale=_scale_bytes(a.fused_wqa_wkv.weight_scale),
+            wqkv=wqkv[0],
+            wqkv_scale=wqkv[1],
             q_norm=a.q_norm.weight,
             kv_norm=a.kv_norm.weight,
-            wq_b=a.wq_b.weight,
-            wq_b_scale=_scale_bytes(a.wq_b.weight_scale),
-            wo_a=a.wo_a.weight,
-            wo_a_scale=_scale_bytes(a.wo_a.weight_scale),
-            wo_b=a.wo_b.weight,
-            wo_b_scale=_scale_bytes(a.wo_b.weight_scale),
+            wq_b=wq_b[0],
+            wq_b_scale=wq_b[1],
+            wo_a=wo_a[0],
+            wo_a_scale=wo_a[1],
+            wo_b=wo_b[0],
+            wo_b_scale=wo_b[1],
             attn_sink=a.attn_sink,
             cos_sin=a.rotary_emb.cos_sin_cache,
             ratio=a.compress_ratio,
